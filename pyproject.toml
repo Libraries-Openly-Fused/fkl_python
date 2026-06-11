@@ -40,9 +40,17 @@ Repository = "https://github.com/johnnynunez/fkl_python"
 [tool.setuptools.packages.find]
 include = ["fkl*"]
 
+[tool.setuptools.package-data]
+# vendored FKL headers (header-only, Apache-2.0): makes wheels self-contained.
+# populate with scripts/vendor_fkl.py before building.
+"fkl._vendor" = ["FusedKernelLibrary/LICENSE",
+                 "FusedKernelLibrary/VENDOR_INFO.txt",
+                 "FusedKernelLibrary/include/**/*.h",
+                 "FusedKernelLibrary/include/**/*.cuh"]
+
 # Environment variables understood at runtime:
-#   FKL_INCLUDE  path to FusedKernelLibrary/include   (required)
-#   FKL_ROOT     path to FusedKernelLibrary repo root (required)
+#   FKL_INCLUDE  override FKL headers (default: vendored copy in the wheel)
+#   FKL_ROOT     override FKL repo root (only needed for in-repo test utils)
 #   CUDA_HOME    path to CUDA toolkit  (default /usr/local/cuda)
 #   FKL_ARCH     GPU arch              (default sm_120)
 #   FKL_STD      C++ standard          (default c++20)

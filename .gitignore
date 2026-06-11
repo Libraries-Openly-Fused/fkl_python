@@ -11,3 +11,4 @@ build/
 err.log
 examples/assets/
 .venv-yolo/
+fkl/_vendor/
