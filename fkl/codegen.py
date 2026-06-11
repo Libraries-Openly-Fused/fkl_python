@@ -21,7 +21,7 @@ from .operations import Op, ChainState, READ, WRITE
 from .types import DType
 
 # bump when generate_cu's emitted C++ changes for the SAME signature inputs
-CODEGEN_VERSION = 5
+CODEGEN_VERSION = 6
 
 
 def plan(ops: List[Op], in_dtype: DType, in_shape: Tuple[int, int, int],

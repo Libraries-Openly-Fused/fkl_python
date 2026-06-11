@@ -243,19 +243,9 @@ class ColorConversion(Op):
 
     def cpp(self, state, pbase):
         out = self.out_dtype(state.dtype)
-        code = self._code
-        # FKL main-branch bug: BGR*2GRAY aliases expand to
-        # FusedOperation<raw Operations...> which lacks ::build. Decompose to
-        # the equivalent reorder + RGB2GRAY (identical semantics).
-        if code == "BGR2GRAY":
-            return (f"VectorReorder<{state.dtype}, 2, 1, 0>::build(), "
-                    f"ColorConversion<ColorConversionCodes::COLOR_RGB2GRAY, "
-                    f"{state.dtype}, {out}>::build()")
-        if code == "BGRA2GRAY":
-            return (f"VectorReorder<{state.dtype}, 2, 1, 0, 3>::build(), "
-                    f"ColorConversion<ColorConversionCodes::COLOR_RGBA2GRAY, "
-                    f"{state.dtype}, {out}>::build()")
-        return (f"ColorConversion<ColorConversionCodes::COLOR_{code}, "
+        # LTS-C++17 fixed the FusedOperation aliases (issue #244): all codes
+        # build directly now.
+        return (f"ColorConversion<ColorConversionCodes::COLOR_{self._code}, "
                 f"{state.dtype}, {out}>::build()")
 
     def token(self, state):

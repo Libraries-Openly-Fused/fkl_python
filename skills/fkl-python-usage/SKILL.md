@@ -180,9 +180,9 @@ On compile errors the offending .cu is kept in ~/.cache/fkl/ - read it.
 1. Chain must be TensorRead() first, TensorWrite()/TensorSplit() last.
 2. Non-contiguous tensors are rejected (zero-copy needs contiguity).
 3. MxVFloat3 requires the chain state to be exactly float3.
-4. ColorConversion("BGR2GRAY"/"BGRA2GRAY") is decomposed into
-   VectorReorder + RGB2GRAY because the FKL main-branch alias for these
-   expands to a FusedOperation without ::build (upstream bug).
+4. fkl-python targets FKL's **LTS-C++17** branch (the active one). All
+   ColorConversion codes build directly there; stale `main` lacks the
+   #244 fix and the BGR2GRAY-family aliases won't compile against it.
 5. Resize with aspect_ratio != "ignore" REQUIRES background=...
 6. First call per signature takes seconds (compile); benchmark AFTER it.
 7. Vector value ops bind channel count at codegen: Mul((1,2,3)) on a

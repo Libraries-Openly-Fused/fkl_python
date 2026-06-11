@@ -272,12 +272,12 @@ void fkl_entry(void* d_in, void* d_out, const FklDims* dims,
                            (uint)dims->out_h, (uint)dims->out_planes, 1,
                            MemType::Device);
     {seq_decl_block}
-    // NOTE: we launch the divergent kernel directly instead of going through
-    // Executor<DivergentBatchTransformDPP>: its fuseBackSequence() calls
-    // fuse_back<IOps...> with explicit (non-ref) template args over a const
-    // tuple, which fails to compile (rvalue-ref binding to const lvalue).
-    // Upstream FKL bug; our sequences carry no ReadBack ops so fuse_back
-    // would be a no-op anyway.
+    // NOTE: direct kernel launch instead of Executor<DivergentBatchTransformDPP>.
+    // LTS fixed the fuse_back compile error (issue #245), BUT the Executor's
+    // getActiveThreads SUMS the z extents of all sequences. Our model gives
+    // EVERY sequence a full-batch read (selector picks which planes run it),
+    // so Executor would launch num_sequences * B planes and write out of
+    // bounds. grid.z = B with the selector is the intended semantics here.
     const dim3 block(cxp::min::f((uint)dims->in_w, 32u),
                      cxp::min::f((uint)dims->in_h, 8u));
     const dim3 grid((uint)ceil(dims->in_w / (float)block.x),

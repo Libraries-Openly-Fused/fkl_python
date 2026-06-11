@@ -86,9 +86,9 @@ def t_myop():
    whose InstanceType is ReadType -> BackFuser does NOT auto-fuse them with
    the previous read. Codegen wraps them as `fuse(read_expr, batch_expr)`.
    This is keyed off the op having a truthy `_batch` attribute.
-3. ColorConversion BGR2GRAY/BGRA2GRAY aliases expand to FusedOperation
-   without ::build on main branch -> decompose into
-   VectorReorder<I,2,1,0>::build() + RGB2GRAY build (two IOps).
+3. FKL's LTS-C++17 branch is the supported base (it carries the fix for
+   issue #244, ColorConversion FusedOperation aliases). On stale `main`
+   the BGR2GRAY-family aliases fail to compile (see #244/#248).
 4. Ops whose alias resolves to a type WITHOUT build() exist; always check
    the alias chain in the header, not just the struct name.
 5. CUDA 13.3 deprecation warnings for long4/ulong4 are noise; only grep
