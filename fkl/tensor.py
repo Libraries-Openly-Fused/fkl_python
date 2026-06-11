@@ -19,6 +19,7 @@ class DeviceView:
     planes: int
     dtype: DType
     obj: object  # keeps the underlying buffer alive
+    device: int = 0
 
 
 def as_device_view(x) -> "DeviceView":
@@ -31,7 +32,22 @@ def as_device_view(x) -> "DeviceView":
         # require C-contiguous for now (zero-copy without repacking)
         raise ValueError("non-contiguous arrays not supported; call .contiguous() first")
     dt, w, h, p = from_cai(cai["shape"], cai["typestr"])
-    return DeviceView(int(cai["data"][0]), w, h, p, dt, x)
+    return DeviceView(int(cai["data"][0]), w, h, p, dt, x, _device_of(x))
+
+
+def _device_of(x) -> int:
+    """Best-effort device index: DeviceBuffer.device, torch .device.index,
+    cupy .device.id; default 0 (CAI itself carries no device id)."""
+    d = getattr(x, "device", None)
+    if d is None:
+        return 0
+    if isinstance(d, int):
+        return d
+    idx = getattr(d, "index", None)       # torch.device
+    if idx is not None:
+        return int(idx)
+    did = getattr(d, "id", None)          # cupy.cuda.Device
+    return int(did) if did is not None else 0
 
 
 def stream_handle(stream) -> int:
@@ -47,13 +63,18 @@ def stream_handle(stream) -> int:
 
 
 class DeviceBuffer:
-    """Dependency-free device buffer via the CUDA driver API."""
+    """Dependency-free device buffer via the CUDA driver API.
+
+    device=N allocates on GPU N (contexts are retained per device and the
+    allocation happens with that device's primary context current)."""
     _cuda = None
-    _ctx = None
+    _ctxs = {}
 
     def __init__(self, width: int, height: int = 1, dtype="float32",
-                 channels: int = 1, planes: int = 1):
+                 channels: int = 1, planes: int = 1, device: int = 0):
         self._load_driver()
+        self.device = int(device)
+        self._activate(self.device)
         from .types import dtype as _d
         base = _d(dtype) if isinstance(dtype, str) else dtype
         self.dtype = DType(base.base, channels if channels > 1 else base.channels)
@@ -64,9 +85,23 @@ class DeviceBuffer:
                                              ctypes.c_size_t(self._nbytes)))
 
     @classmethod
-    def from_state(cls, st):
+    def from_state(cls, st, device: int = 0):
         return cls(st.width, st.height, st.dtype.base,
-                   channels=st.dtype.channels, planes=st.planes)
+                   channels=st.dtype.channels, planes=st.planes, device=device)
+
+    @classmethod
+    def _activate(cls, device: int):
+        """Make `device`'s primary context current for this thread."""
+        if device not in cls._ctxs:
+            dev = ctypes.c_int(0)
+            if cls._cuda.cuDeviceGet(ctypes.byref(dev), device) != 0:
+                raise RuntimeError(f"cuDeviceGet({device}) failed — "
+                                   f"is GPU {device} present?")
+            ctx = ctypes.c_void_p()
+            if cls._cuda.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev) != 0:
+                raise RuntimeError(f"cuDevicePrimaryCtxRetain({device}) failed")
+            cls._ctxs[device] = ctx
+        cls._cuda.cuCtxSetCurrent(cls._ctxs[device])
 
     @property
     def ptr(self) -> int:
@@ -87,15 +122,8 @@ class DeviceBuffer:
             lib.cuMemcpyDtoH_v2.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
             if lib.cuInit(0) != 0:
                 raise RuntimeError("cuInit failed")
-            dev = ctypes.c_int(0)
-            if lib.cuDeviceGet(ctypes.byref(dev), 0) != 0:
-                raise RuntimeError("cuDeviceGet failed")
-            ctx = ctypes.c_void_p()
-            if lib.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), dev) != 0:
-                raise RuntimeError("cuDevicePrimaryCtxRetain failed")
-            lib.cuCtxSetCurrent(ctx)
             cls._cuda = lib
-            cls._ctx = ctx
+            cls._activate(0)
 
     def _check(self, code):
         if code != 0:
@@ -131,7 +159,7 @@ class DeviceBuffer:
     # no copy, no sync beyond what the consumer framework inserts.
 
     def __dlpack_device__(self):
-        return (2, 0)  # (kDLCUDA, device 0)
+        return (2, self.device)  # (kDLCUDA, device_id)
 
     def __dlpack__(self, stream=None):
         return _make_dlpack_capsule(self)
@@ -207,7 +235,7 @@ def _make_dlpack_capsule(buf: "DeviceBuffer"):
 
     managed = _DLManagedTensor()
     managed.dl_tensor.data = ctypes.c_void_p(buf.ptr)
-    managed.dl_tensor.device = _DLDevice(2, 0)          # kDLCUDA, dev 0
+    managed.dl_tensor.device = _DLDevice(2, getattr(buf, "device", 0))  # kDLCUDA
     managed.dl_tensor.ndim = ndim
     managed.dl_tensor.dtype = _DLDataType(code, bits, 1)
     managed.dl_tensor.shape = shape_arr

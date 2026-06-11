@@ -51,7 +51,7 @@ class CircularTensor:
     def __init__(self, width: int, height: int, batch: int,
                  dtype="uint8", channels: int = 1,
                  order: str = "newest_first", layout: str = "packed",
-                 out_dtype=None):
+                 out_dtype=None, device: int = 0):
         if order not in _ORDERS:
             raise ValueError(f"order must be one of {tuple(_ORDERS)}")
         if layout not in _LAYOUTS:
@@ -67,6 +67,7 @@ class CircularTensor:
             self.store_dtype = self.store_dtype.with_channels(self.in_dtype.channels)
         self.width, self.height, self.batch = int(width), int(height), int(batch)
         self.order, self.layout = order, layout
+        self.device = int(device)
         self._lib = None
         self._handle = None
         self._chain_key = None
@@ -89,6 +90,9 @@ class CircularTensor:
             raise TypeError(f"frame dtype {v.dtype} != declared {self.in_dtype}")
 
         self._ensure_compiled(ops)
+        if self.device != 0:
+            DeviceBuffer._load_driver()
+            DeviceBuffer._activate(self.device)
         params = []
         shape = (self.width, self.height, 1)
         dt = self.in_dtype
@@ -111,10 +115,11 @@ class CircularTensor:
         if self.layout == "planar":
             out = DeviceBuffer(self.width, self.height,
                                self.store_dtype.base, channels=1,
-                               planes=self.batch * ch)
+                               planes=self.batch * ch, device=self.device)
         else:
             out = DeviceBuffer(self.width, self.height, self.store_dtype.base,
-                               channels=ch, planes=self.batch)
+                               channels=ch, planes=self.batch,
+                               device=self.device)
         self._lib.ct_snapshot(self._handle, ctypes.c_void_p(out.ptr),
                               ctypes.c_void_p(stream_handle(stream)))
         return out
@@ -188,6 +193,9 @@ class CircularTensor:
         lib.ct_snapshot.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                     ctypes.c_void_p]
         lib.ct_destroy.argtypes = [ctypes.c_void_p]
+        if self.device != 0:
+            DeviceBuffer._load_driver()
+            DeviceBuffer._activate(self.device)   # PyCT allocates on current dev
         self._handle = lib.ct_create(self.width, self.height)
         if not self._handle:
             raise RuntimeError("ct_create failed")

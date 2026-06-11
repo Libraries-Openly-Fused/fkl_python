@@ -83,10 +83,54 @@ backends (clang with auto-shims, nvcc):
 | test_warping_splitwrite          | 8     | PASS  | PASS |
 | test_niche_ops                   | 9     | PASS  | PASS |
 | test_dlpack                      | 9     | PASS  | PASS |
-| test_circular_tensor             | 10    | PASS  | PASS |
+| test_circular_tensor             | 21    | PASS  | PASS |
+| test_thread_fusion               | 5     | PASS  | PASS |
 | test_e2e (timing/cache)          | 1     | PASS  | PASS |
 
-112 checks per backend. Steady-state hot launch ~70 µs/call; cache-hit
+Plus, separately: test_torch_integration (9 checks, real torch 2.12+cu130:
+zero-copy both ways, external streams, CircularTensor->torch) and
+test_cpu_backend (5 checks, ParArch::CPU with numpy in/out, CPU==GPU
+cross-validated).
+
+## CPU backend (no CUDA required)
+
+```python
+pipe = fkl.compose(fkl.TensorRead(), fkl.Mul(2.0), fkl.TensorWrite(),
+                   target="cpu")
+out = pipe(numpy_array)        # numpy in -> numpy out, ParArch::CPU
+```
+Same fused chains, FKL's CPU executor, plain C++ .so (clang++; g++ rejects
+Stream_<ParArch::CPU>'s ctor spelling). Results cross-validated against
+the GPU backend.
+
+## ThreadFusion
+
+```python
+pipe = fkl.compose(..., thread_fusion=True)   # TF::ENABLED, GPU only
+```
+Vectorized multi-element threads. Auto-falls back to scalar for shapes
+whose row bytes aren't 16-aligned (external tight-pitch pointers would
+fault on float4 loads).
+
+## Multi-GPU
+
+`DeviceBuffer(..., device=N)`, `CircularTensor(..., device=N)`; `compose`
+pipelines follow the input tensor's device (torch `cuda:N`, cupy device id,
+DeviceBuffer.device). DLPack exports carry the right device id. NOTE: this
+box has 1 GPU — device routing is implemented and exercised on device 0;
+true multi-GPU runs still need a 2+ GPU machine.
+
+## Known structural limits
+
+- `fk::Equal` and other Tuple-input ops need a multi-source read (a read
+  producing `Tuple<A,B>` from two pointers). FKL has no such Read op yet —
+  upstream feature candidate, not wrappable from here.
+- Divergent HF goes through a direct kernel launch (not the Executor)
+  because of upstream issue
+  [#250](https://github.com/Libraries-Openly-Fused/FusedKernelLibrary/issues/250)
+  (grid.z = sum of sequence z-extents).
+
+128 checks per backend (+ 9 torch + 5 cpu separately). Steady-state hot launch ~70 µs/call; cache-hit
 compose ~0 ms (lazy); cold compile ~1-3 s once per chain signature.
 
 ## Temporal video: CircularTensor
