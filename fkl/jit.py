@@ -226,9 +226,12 @@ class FusedKernel:
 
 def compose(*ops: Op, target: str = "gpu",
             thread_fusion: bool = False) -> FusedKernel:
-    """thread_fusion=True enables FKL's ThreadFusion (TF::ENABLED):
+    """thread_fusion=True opts into FKL's ThreadFusion (TF::ENABLED):
     each thread processes multiple elements with vectorized accesses.
-    GPU-only; best for wide images with simple per-pixel chains."""
+    DEFAULT IS FALSE, matching FKL's own TransformDPP<> default
+    (TF::DISABLED): per upstream guidance it only pays off in a small set
+    of cases (wide images, trivial chains, bandwidth-bound) — benchmark
+    your pipeline before enabling. GPU-only."""
     return FusedKernel(list(ops), target=target, thread_fusion=thread_fusion)
 
 
