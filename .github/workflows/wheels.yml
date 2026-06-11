@@ -170,3 +170,33 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build, codegen-compile-check]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fkl-python
+    permissions:
+      id-token: write   # OIDC token for PyPI Trusted Publishing (no API keys)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      # Trusted Publishing: PyPI trusts this repo+workflow+environment via
+      # OIDC. One-time setup on pypi.org (no secrets stored in GitHub):
+      #   PyPI -> Your projects -> Publishing -> Add a new pending publisher
+      #     project:     fkl-python
+      #     owner:       <repo owner, e.g. Libraries-Openly-Fused>
+      #     repository:  fkl_python
+      #     workflow:    wheels.yml
+      #     environment: pypi
+      - name: Publish to PyPI (trusted publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
