@@ -31,6 +31,9 @@ disk cache in `~/.cache/fkl/` and start instantly.
 | `06_warping_and_borders.py` | affine rotation / perspective warp (animatable, no recompile), border policies on OOB crops |
 | `07_torch_interop_dlpack.py` | torch/cupy inputs, DLPack zero-copy outputs, external streams, preallocated outputs |
 | `08_performance.py` | cold compile vs cache hit vs hot launch; fused chain vs 6 separate kernels |
+| `09_video_temporal_window.py` | CircularTensor: rolling N-frame window for temporal models, one fused update per frame |
+| `10_torch_realworld.py` | torch-specific recipe (needs torch+cuda installed) |
+| `11_yolo_inference.py` | **REAL end-to-end**: JPEG -> ONE fused GPU kernel (letterbox+normalize+CHW) -> YOLOv8n ONNX -> NMS -> boxes. Run `./fetch_yolo_assets.sh` first; needs `pip install numpy pillow onnxruntime` |
 
 ## The one-page mental model
 
