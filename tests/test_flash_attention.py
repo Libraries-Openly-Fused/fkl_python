@@ -233,10 +233,122 @@ def t_fp8_kv():
     check_true(f"FA fp8-KV mma path (err={err2:.2e})", err2 < 6e-2)
 
 
+def _oracle_mod(q, k, v, causal, scale, mod):
+    """fp64 reference with score transform mod(s, q_idx, kv_idx)."""
+    q, k, v = q.astype(np.float64), k.astype(np.float64), v.astype(np.float64)
+    bh, sq, d = q.shape
+    sk = k.shape[1]
+    qi = np.arange(sq)[:, None]
+    ki = np.arange(sk)[None, :]
+    out = np.zeros((bh, sq, d))
+    for b in range(bh):
+        s = q[b] @ k[b].T * scale
+        s = mod(s, qi, ki)
+        if causal:
+            s = np.where(ki > qi, -np.inf, s)
+        s = s - s.max(axis=1, keepdims=True)
+        p = np.exp(s)
+        p /= p.sum(axis=1, keepdims=True)
+        out[b] = p @ v[b]
+    return out
+
+
+def t_flex_alibi():
+    q, k, v = _mk(2, 128, 128, 64, 30)
+    got = _from_gpu(fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                                        causal=True,
+                                        score_mod=fkl.ALiBi(0.0625)), q.shape)
+    ref = _oracle_mod(q, k, v, True, 1 / math.sqrt(64),
+                      lambda s, qi, ki: s - 0.0625 * (qi - ki))
+    err = np.abs(got - ref).max()
+    check_true(f"flex ALiBi causal (err={err:.2e})", err < 5e-3)
+
+
+def t_flex_softcap():
+    q, k, v = _mk(2, 128, 128, 64, 31)
+    got = _from_gpu(fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                                        causal=True,
+                                        score_mod=fkl.SoftCap(20.0)), q.shape)
+    ref = _oracle_mod(q, k, v, True, 1 / math.sqrt(64),
+                      lambda s, qi, ki: 20.0 * np.tanh(s / 20.0))
+    err = np.abs(got - ref).max()
+    check_true(f"flex SoftCap(20) causal (err={err:.2e})", err < 5e-3)
+
+
+def t_flex_sliding_window():
+    q, k, v = _mk(2, 128, 128, 64, 32)
+    got = _from_gpu(fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                                        causal=True,
+                                        score_mod=fkl.SlidingWindow(32)),
+                    q.shape)
+    ref = _oracle_mod(q, k, v, True, 1 / math.sqrt(64),
+                      lambda s, qi, ki: np.where(qi - ki >= 32, -np.inf, s))
+    err = np.abs(got - ref).max()
+    check_true(f"flex SlidingWindow(32) causal (err={err:.2e})", err < 5e-3)
+
+
+def t_flex_values_no_recompile():
+    """Same mod TYPE with new value -> same compiled kernel, fresh result."""
+    q, k, v = _mk(1, 128, 128, 64, 33)
+    g1 = _from_gpu(fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                                       score_mod=fkl.SoftCap(20.0)), q.shape)
+    g2 = _from_gpu(fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                                       score_mod=fkl.SoftCap(5.0)), q.shape)
+    r2 = _oracle_mod(q, k, v, False, 1 / math.sqrt(64),
+                     lambda s, qi, ki: 5.0 * np.tanh(s / 5.0))
+    diff = np.abs(g1 - g2).max()
+    err = np.abs(g2 - r2).max()
+    check_true(f"flex value swap no-recompile (diff={diff:.2e}, err={err:.2e})",
+               diff > 1e-4 and err < 5e-3)
+
+
+def t_block_sparse():
+    bh, s, d, blk = 2, 512, 64, 128
+    q, k, v = _mk(bh, s, s, d, 34)
+    n = s // blk
+    rng = np.random.default_rng(35)
+    mask = (rng.uniform(size=(bh, n, n)) < 0.5).astype(np.uint8)
+    mask[:, :, 0] = 1   # guarantee a live block per row
+    bm = fkl.BlockMask(mask, blk, blk)
+    got = _from_gpu(fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                                        block_mask=bm), q.shape)
+
+    def mod(srow, qi, ki):
+        keep = mask_b[qi // blk, ki // blk].astype(bool)
+        return np.where(keep, srow, -np.inf)
+
+    ref = np.zeros_like(q, dtype=np.float64)
+    for b in range(bh):
+        mask_b = mask[b]
+        ref[b] = _oracle_mod(q[b:b+1], k[b:b+1], v[b:b+1], False,
+                             1 / math.sqrt(d), mod)[0]
+    err = np.abs(got - ref).max()
+    check_true(f"block-sparse 50% d64 s512 (err={err:.2e})", err < 5e-3)
+
+
+def t_block_sparse_causal_helper():
+    bh, s, d, blk = 2, 256, 64, 128
+    q, k, v = _mk(bh, s, s, d, 36)
+    bm = fkl.BlockMask.causal(bh, s, blk)
+    # block-causal == full attention inside diagonal blocks, none above
+    got = _from_gpu(fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                                        block_mask=bm), q.shape)
+
+    def mod(srow, qi, ki):
+        return np.where((ki // blk) > (qi // blk), -np.inf, srow)
+
+    ref = _oracle_mod(q, k, v, False, 1 / math.sqrt(d), mod)
+    err = np.abs(got - ref).max()
+    check_true(f"BlockMask.causal helper (err={err:.2e})", err < 5e-3)
+
+
 if __name__ == "__main__":
     run([t_dense_causal, t_dense_cross_ragged, t_compressed_kv,
          t_fused_epilogue, t_epilogue_values_no_recompile,
          t_single_query_decode, t_prologue_q, t_prologue_v_affine,
          t_prologue_int8_kv, t_prologue_values_no_recompile,
-         t_mma_dense_causal, t_mma_prologue_epilogue, t_fp8_kv],
+         t_mma_dense_causal, t_mma_prologue_epilogue, t_fp8_kv,
+         t_flex_alibi, t_flex_softcap, t_flex_sliding_window,
+         t_flex_values_no_recompile, t_block_sparse,
+         t_block_sparse_causal_helper],
         "flash-attention")
