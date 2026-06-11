@@ -106,11 +106,15 @@ the GPU backend.
 ## ThreadFusion
 
 ```python
-pipe = fkl.compose(..., thread_fusion=True)   # TF::ENABLED, GPU only
+pipe = fkl.compose(..., thread_fusion=True)   # opt-in, GPU only
 ```
-Vectorized multi-element threads. Auto-falls back to scalar for shapes
-whose row bytes aren't 16-aligned (external tight-pitch pointers would
-fault on float4 loads).
+**Disabled by default**, matching FKL's own default (`TransformDPP<>` =
+`TF::DISABLED`). Per Oscar: ThreadFusion only improves performance in a
+small set of cases (wide images, trivial per-pixel chains, bandwidth-bound)
+— benchmark YOUR pipeline before enabling it; it is not a general speedup.
+When enabled it emits `TransformDPP<GPU_NVIDIA, TF::ENABLED>` and
+auto-falls back to scalar for shapes whose row bytes aren't 16-aligned
+(external tight-pitch pointers would fault on vectorized loads).
 
 ## Multi-GPU
 
