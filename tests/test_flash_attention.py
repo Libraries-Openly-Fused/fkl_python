@@ -210,10 +210,33 @@ def t_mma_prologue_epilogue():
                err < 5e-2)
 
 
+def t_fp8_kv():
+    """fp8 e4m3 KV cache: exact vs dequantized oracle is impractical from
+    python (needs fp8 decode), so verify quant-bounded e2e accuracy and the
+    memory ratio; mma path exercises the QUANT_KV cp.async schedule."""
+    q, k, v = _mk(2, 48, 96, 64, 20)
+    kc = fkl.compress_kv(_to_gpu(k), fmt="fp8")
+    vc = fkl.compress_kv(_to_gpu(v), fmt="fp8")
+    ratio = (k.size * 4) / kc.nbytes
+    check_true(f"FP8 KV compression ratio {ratio:.2f}x (>3.5x)", ratio > 3.5)
+
+    got = _from_gpu(fkl.flash_attention(_to_gpu(q), kc, vc, causal=True), q.shape)
+    ref = _oracle(q, k, v, True, 1 / math.sqrt(64))
+    err = np.abs(got - ref).max()
+    # e4m3 has 3 mantissa bits (~6% rel err); on UNIFORM data int8's 127
+    # uniform levels are tighter. fp8 wins on outlier-heavy real caches.
+    check_true(f"FA fp8-KV e2e quant-bounded (err={err:.2e})", err < 6e-2)
+
+    got2 = _from_gpu(fkl.flash_attention(_to_gpu(q), kc, vc, causal=True,
+                                         mma=True), q.shape)
+    err2 = np.abs(got2 - ref).max()
+    check_true(f"FA fp8-KV mma path (err={err2:.2e})", err2 < 6e-2)
+
+
 if __name__ == "__main__":
     run([t_dense_causal, t_dense_cross_ragged, t_compressed_kv,
          t_fused_epilogue, t_epilogue_values_no_recompile,
          t_single_query_decode, t_prologue_q, t_prologue_v_affine,
          t_prologue_int8_kv, t_prologue_values_no_recompile,
-         t_mma_dense_causal, t_mma_prologue_epilogue],
+         t_mma_dense_causal, t_mma_prologue_epilogue, t_fp8_kv],
         "flash-attention")

@@ -30,12 +30,13 @@ from .types import dtype as _dtype
 
 
 class CompressedKV:
-    """int8-per-token compressed KV tensor + per-token scales (on GPU)."""
+    """Compressed KV tensor + per-token scales (on GPU). fmt: 'int8' | 'fp8'."""
 
     def __init__(self, data: DeviceBuffer, scales: DeviceBuffer,
-                 batch_heads: int, seq: int, head_dim: int):
+                 batch_heads: int, seq: int, head_dim: int, fmt: str = "int8"):
         self.data, self.scales = data, scales
         self.batch_heads, self.seq, self.head_dim = batch_heads, seq, head_dim
+        self.fmt = fmt
 
     @property
     def nbytes(self) -> int:
@@ -46,16 +47,17 @@ _quant_lib = None
 
 
 def _quant_so():
-    """Tiny standalone kernel for GPU-side per-token int8 quantization."""
+    """Tiny standalone kernel for GPU-side per-token int8/fp8 quantization."""
     global _quant_lib
     if _quant_lib is not None:
         return _quant_lib
     src = r"""
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
 #include <math.h>
-extern "C" {
-__global__ void quant_kernel(const float* dense, signed char* q8, float* scales,
-                             int tokens, int headDim) {
+template <bool FP8>
+__global__ void quant_kernel_t(const float* dense, signed char* q8, float* scales,
+                               int tokens, int headDim) {
     const int t = blockIdx.x;
     if (t >= tokens) return;
     __shared__ float smax[256];
@@ -68,30 +70,46 @@ __global__ void quant_kernel(const float* dense, signed char* q8, float* scales,
         if (threadIdx.x < s) smax[threadIdx.x] = fmaxf(smax[threadIdx.x], smax[threadIdx.x + s]);
         __syncthreads();
     }
-    const float sc = smax[0] > 0.f ? smax[0] / 127.f : 1.f;
+    const float sc = smax[0] > 0.f ? smax[0] / (FP8 ? 448.f : 127.f) : 1.f;
     if (threadIdx.x == 0) scales[t] = sc;
     for (int d = threadIdx.x; d < headDim; d += blockDim.x) {
-        q8[(long)t * headDim + d] = (signed char)nearbyintf(dense[(long)t * headDim + d] / sc);
+        const float x = dense[(long)t * headDim + d] / sc;
+        if (FP8) {
+            const __nv_fp8_e4m3 f8(x);
+            q8[(long)t * headDim + d] = (signed char)f8.__x;
+        } else {
+            q8[(long)t * headDim + d] = (signed char)nearbyintf(x);
+        }
     }
 }
+extern "C" {
 void quantize(const float* dense, signed char* q8, float* scales,
               int tokens, int headDim, void* stream) {
-    quant_kernel<<<tokens, 256, 0, (cudaStream_t)stream>>>(dense, q8, scales, tokens, headDim);
+    quant_kernel_t<false><<<tokens, 256, 0, (cudaStream_t)stream>>>(dense, q8, scales, tokens, headDim);
+    cudaStreamSynchronize((cudaStream_t)stream);
+}
+void quantize_fp8(const float* dense, signed char* q8, float* scales,
+                  int tokens, int headDim, void* stream) {
+    quant_kernel_t<true><<<tokens, 256, 0, (cudaStream_t)stream>>>(dense, q8, scales, tokens, headDim);
     cudaStreamSynchronize((cudaStream_t)stream);
 }
 }
 """
-    so = get_backend().compile(src, f"kvquant;cg={CODEGEN_VERSION}")
+    so = get_backend().compile(src, f"kvquant;cg={CODEGEN_VERSION};v=2")
     lib = ctypes.CDLL(str(so))
-    lib.quantize.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                             ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    for fn in (lib.quantize, lib.quantize_fp8):
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                       ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
     _quant_lib = lib
     return lib
 
 
-def compress_kv(kv) -> CompressedKV:
+def compress_kv(kv, fmt: str = "int8") -> CompressedKV:
     """Compress a (batch_heads, seq, head_dim) float32 K or V tensor to the
-    int8-per-token layout ON the GPU. ~4x memory reduction vs fp32."""
+    int8- or fp8(e4m3)-per-token layout ON the GPU. ~4x smaller than fp32.
+    fp8 keeps more precision near zero (attention tails) at the same size."""
+    if fmt not in ("int8", "fp8"):
+        raise ValueError("fmt must be 'int8' or 'fp8'")
     v = as_device_view(kv)
     if v.dtype.base != "float32":
         raise TypeError("compress_kv expects float32 input (cast first)")
@@ -101,10 +119,10 @@ def compress_kv(kv) -> CompressedKV:
     tokens = bh * seq
     q8 = DeviceBuffer(hd, seq, "int8", planes=bh)
     scales = DeviceBuffer(tokens, 1, "float32")
-    _quant_so().quantize(ctypes.c_void_p(v.ptr), ctypes.c_void_p(q8.ptr),
-                         ctypes.c_void_p(scales.ptr), tokens, hd,
-                         ctypes.c_void_p(0))
-    return CompressedKV(q8, scales, bh, seq, hd)
+    fn = _quant_so().quantize_fp8 if fmt == "fp8" else _quant_so().quantize
+    fn(ctypes.c_void_p(v.ptr), ctypes.c_void_p(q8.ptr),
+       ctypes.c_void_p(scales.ptr), tokens, hd, ctypes.c_void_p(0))
+    return CompressedKV(q8, scales, bh, seq, hd, fmt)
 
 
 class FlashAttention:
@@ -123,8 +141,8 @@ class FlashAttention:
                  prologue_v=None, mma: bool = False):
         if head_dim % 32 != 0:
             raise ValueError("head_dim must be a multiple of 32")
-        if kv_layout not in ("dense", "int8"):
-            raise ValueError("kv_layout must be 'dense' or 'int8'")
+        if kv_layout not in ("dense", "int8", "fp8"):
+            raise ValueError("kv_layout must be 'dense', 'int8' or 'fp8'")
         self.head_dim = head_dim
         self.kv_layout = kv_layout
         self.mma = bool(mma)   # tensor-core (bf16 mma.sync) path
@@ -146,9 +164,12 @@ class FlashAttention:
         if hd != self.head_dim:
             raise ValueError(f"q head_dim {hd} != compiled {self.head_dim}")
 
-        if self.kv_layout == "int8":
+        if self.kv_layout in ("int8", "fp8"):
             if not isinstance(k, CompressedKV) or not isinstance(v, CompressedKV):
-                raise TypeError("int8 layout expects CompressedKV (use fkl.compress_kv)")
+                raise TypeError("compressed layout expects CompressedKV (use fkl.compress_kv)")
+            if k.fmt != self.kv_layout or v.fmt != self.kv_layout:
+                raise TypeError(f"CompressedKV fmt mismatch: kernel={self.kv_layout}, "
+                                f"k={k.fmt}, v={v.fmt}")
             seq_k = k.seq
             kptr, vptr = k.data.ptr, v.data.ptr
             ks, vs = k.scales.ptr, v.scales.ptr
@@ -218,6 +239,9 @@ class FlashAttention:
         if self.kv_layout == "int8":
             k_read = "makeInt8KVRead((const signed char*)k, kScale, bh, seqK, HD)"
             v_read = "makeInt8KVRead((const signed char*)v, vScale, bh, seqK, HD)"
+        elif self.kv_layout == "fp8":
+            k_read = "makeFp8KVRead(k, kScale, bh, seqK, HD)"
+            v_read = "makeFp8KVRead(v, vScale, bh, seqK, HD)"
         else:
             k_read = "makeAttentionRead((const float*)k, bh, seqK, HD)"
             v_read = "makeAttentionRead((const float*)v, bh, seqK, HD)"
@@ -297,7 +321,7 @@ def flash_attention(q, k, v, out=None, causal=False, scale=None, stream=None,
     ~1e-3 abs error on unit inputs (vs ~5e-7 SIMT fp32) but order-of-
     magnitude faster. Same prologue/epilogue fusion."""
     if kv_layout is None:
-        kv_layout = "int8" if isinstance(k, CompressedKV) else "dense"
+        kv_layout = k.fmt if isinstance(k, CompressedKV) else "dense"
     vq = as_device_view(q)
 
     def _key(ops):
