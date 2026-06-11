@@ -74,14 +74,9 @@ def dtype(spec) -> DType:
     return DType(spec, 1)
 
 
-def from_cai(shape, typestr) -> tuple["DType", int, int, int]:
-    """(shape, typestr) -> (DType, width, height, planes).
-
-    Trailing dim of size 2..4 is folded into a vector pixel type.
-    """
-    base = _TYPESTR_TO_BASE.get(typestr)
-    if base is None:
-        raise TypeError(f"unsupported typestr {typestr!r}")
+def from_shape(shape, base) -> tuple["DType", int, int, int]:
+    """(shape, base name) -> (DType, width, height, planes). Same folding
+    rules as from_cai but without typestr parsing (fast path)."""
     ch = 1
     dims = list(shape)
     if len(dims) >= 2 and 2 <= dims[-1] <= 4:
@@ -97,6 +92,17 @@ def from_cai(shape, typestr) -> tuple["DType", int, int, int]:
     else:
         raise TypeError(f"unsupported shape {shape}")
     return DType(base, ch), int(w), int(h), int(p)
+
+
+def from_cai(shape, typestr) -> tuple["DType", int, int, int]:
+    """(shape, typestr) -> (DType, width, height, planes).
+
+    Trailing dim of size 2..4 is folded into a vector pixel type.
+    """
+    base = _TYPESTR_TO_BASE.get(typestr)
+    if base is None:
+        raise TypeError(f"unsupported typestr {typestr!r}")
+    return from_shape(shape, base)
 
 
 # constants for value packing in codegen
