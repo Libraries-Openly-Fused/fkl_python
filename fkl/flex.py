@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import ctypes
 
-import numpy as np
-
+# NOTE: numpy is imported lazily inside the methods that need it. The core
+# package contract is "import fkl works with zero python deps" (see
+# pyproject: dependencies = []); numpy is only required if you actually
+# construct a BlockMask from a host array.
 from .tensor import DeviceBuffer, as_device_view
 
 
@@ -109,6 +111,7 @@ class BlockMask:
     (128 is always safe for the defaults)."""
 
     def __init__(self, mask, block_q: int = 128, block_kv: int = 128):
+        import numpy as np
         if isinstance(mask, np.ndarray):
             if mask.ndim != 3:
                 raise ValueError("mask must be (bh, nQBlocks, nKVBlocks)")
@@ -129,6 +132,7 @@ class BlockMask:
     @staticmethod
     def causal(bh: int, seq: int, block: int = 128) -> "BlockMask":
         """Convenience: block-causal mask (tile fully above diagonal -> skip)."""
+        import numpy as np
         n = (seq + block - 1) // block
         m = np.zeros((bh, n, n), dtype=np.uint8)
         for qb in range(n):
