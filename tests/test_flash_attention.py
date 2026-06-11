@@ -137,7 +137,83 @@ def t_single_query_decode():
     check_true(f"FA decode step s_q=1 vs s_k=256 int8 (err={err:.2e})", err < 2e-2)
 
 
+def t_prologue_q():
+    """Q prologue Mul(2): equals oracle on 2*Q (fused in the Read IOp)."""
+    q, k, v = _mk(2, 24, 48, 32, 7)
+    got = _from_gpu(
+        fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                            prologue_q=[fkl.Mul(2.0)]), q.shape)
+    ref = _oracle(q * 2.0, k, v, False, 1 / math.sqrt(32))
+    err = np.abs(got - ref).max()
+    check_true(f"FA Q-prologue Mul(2) == oracle(2Q) (err={err:.2e})", err < 5e-6)
+
+
+def t_prologue_v_affine():
+    """V prologue Mul(3).then(Add(1)) => 3*out + 1 (since sum p_j = 1)."""
+    q, k, v = _mk(2, 24, 48, 32, 8)
+    got = _from_gpu(
+        fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                            prologue_v=[fkl.Mul(3.0), fkl.Add(1.0)]), q.shape)
+    ref = _oracle(q, k, v, False, 1 / math.sqrt(32))
+    err = np.abs(got - (3.0 * ref + 1.0)).max()
+    check_true(f"FA V-prologue Mul(3).Add(1) == 3*out+1 (err={err:.2e})", err < 5e-6)
+
+
+def t_prologue_int8_kv():
+    """Prologue chains AFTER int8 dequant: V int8 + Mul(2) => 2*out_int8."""
+    q, k, v = _mk(2, 16, 64, 32, 9)
+    kc, vc = fkl.compress_kv(_to_gpu(k)), fkl.compress_kv(_to_gpu(v))
+    base = _from_gpu(fkl.flash_attention(_to_gpu(q), kc, vc), q.shape)
+    got = _from_gpu(fkl.flash_attention(_to_gpu(q), kc, vc,
+                                        prologue_v=[fkl.Mul(2.0)]), q.shape)
+    err = np.abs(got - 2.0 * base).max()
+    check_true(f"FA int8-KV + V-prologue Mul(2) == 2*base (err={err:.2e})",
+               err < 1e-5)
+
+
+def t_prologue_values_no_recompile():
+    """Changing prologue values reuses the cached kernel."""
+    import time
+    q, k, v = _mk(1, 16, 16, 32, 10)
+    _ = fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                            prologue_q=[fkl.Mul(2.0)])      # compiles
+    t0 = time.perf_counter()
+    a = _from_gpu(fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                                      prologue_q=[fkl.Mul(4.0)]), q.shape)
+    dt = time.perf_counter() - t0
+    ref = _oracle(q * 4.0, k, v, False, 1 / math.sqrt(32))
+    ok = np.abs(a - ref).max() < 5e-6 and dt < 1.0
+    check_true(f"FA prologue values change without recompile ({dt*1e3:.0f}ms)", ok)
+
+
+def t_mma_dense_causal():
+    """Tensor-core path (bf16 mma): same oracle, bf16-class tolerance."""
+    q, k, v = _mk(2, 128, 128, 64, 11)
+    out = fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v),
+                              causal=True, mma=True)
+    got = _from_gpu(out, q.shape)
+    ref = _oracle(q, k, v, True, 1 / math.sqrt(64))
+    err = np.abs(got - ref).max()
+    check_true(f"FA mma d64 causal (err={err:.2e})", err < 2e-2)
+
+
+def t_mma_prologue_epilogue():
+    """mma path keeps the FKL superpowers: V-prologue + epilogue fused."""
+    q, k, v = _mk(2, 64, 128, 64, 12)
+    got = _from_gpu(
+        fkl.flash_attention(_to_gpu(q), _to_gpu(k), _to_gpu(v), mma=True,
+                            prologue_v=[fkl.Mul(3.0), fkl.Add(1.0)],
+                            epilogue=[fkl.Mul(2.0)]), q.shape)
+    ref = _oracle(q, k, v, False, 1 / math.sqrt(64))
+    err = np.abs(got - 2.0 * (3.0 * ref + 1.0)).max()
+    check_true(f"FA mma V-prologue+epilogue == 2*(3*out+1) (err={err:.2e})",
+               err < 5e-2)
+
+
 if __name__ == "__main__":
     run([t_dense_causal, t_dense_cross_ragged, t_compressed_kv,
          t_fused_epilogue, t_epilogue_values_no_recompile,
-         t_single_query_decode], "flash-attention")
+         t_single_query_decode, t_prologue_q, t_prologue_v_affine,
+         t_prologue_int8_kv, t_prologue_values_no_recompile,
+         t_mma_dense_causal, t_mma_prologue_epilogue],
+        "flash-attention")
