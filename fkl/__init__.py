@@ -22,6 +22,7 @@ from .operations import (
 )
 from .jit import compose, compose_divergent, FusedKernel, DivergentKernel
 from .circular import CircularTensor
+from .attention import flash_attention, FlashAttention, compress_kv, CompressedKV
 from .backend import CompilerBackend, set_backend, get_backend, clear_cache
 from .tensor import DeviceBuffer
 from .types import DType, dtype
@@ -37,6 +38,7 @@ __all__ = [
     "ColorConversion", "Crop", "Resize", "Warping", "BorderReader", "Deinterlace",
     "compose", "compose_divergent", "FusedKernel", "DivergentKernel",
     "CircularTensor",
+    "flash_attention", "FlashAttention", "compress_kv", "CompressedKV",
     "CompilerBackend", "set_backend", "get_backend", "clear_cache",
     "DeviceBuffer", "DType", "dtype",
 ]
