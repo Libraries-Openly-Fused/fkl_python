@@ -115,9 +115,8 @@ jobs:
           fklroot = os.environ["FKL_ROOT"]
           inc = os.environ["FKL_INCLUDE"]
           arch = os.environ.get("FKL_ARCH", "sm_90")
-          failed = []
-          for name, ops, dt, shape, n in CASES:
-              cu = generate_cu(ops, dt, shape, n)
+
+          def compile_cu(name, cu):
               with tempfile.NamedTemporaryFile("w", suffix=".cu", delete=False) as f:
                   f.write(cu); path = f.name
               r = subprocess.run(
@@ -129,9 +128,30 @@ jobs:
               print(f"{name}: {status}")
               if r.returncode != 0:
                   print(r.stderr[-3000:])
+              return r.returncode == 0
+
+          failed = []
+          for name, ops, dt, shape, n in CASES:
+              if not compile_cu(name, generate_cu(ops, dt, shape, n)):
                   failed.append(name)
+
+          # CircularTensor: stateful, separate codegen path (PyCT + divergent
+          # launch). Compile-check both layouts/orders + a preproc chain.
+          CT_CASES = [
+              ("ct_packed_f32", fkl.CircularTensor(32, 16, batch=4, dtype="float32"),
+               []),
+              ("ct_packed_oldest", fkl.CircularTensor(32, 16, batch=3,
+               dtype="float32", order="oldest_first"), [fkl.Mul(2.0)]),
+              ("ct_planar_u8c3", fkl.CircularTensor(16, 8, batch=2, dtype="uint8",
+               channels=3, layout="planar", out_dtype="float32"),
+               [fkl.Cast("float32"), fkl.Div(255.0)]),
+          ]
+          for name, ct, ops in CT_CASES:
+              if not compile_cu(name, ct.generate_source(ops)):
+                  failed.append(name)
+
           assert not failed, f"codegen compile failures: {failed}"
-          print("all codegen cases compiled")
+          print("all codegen cases compiled (chains + CircularTensor)")
           EOF
 
   release:

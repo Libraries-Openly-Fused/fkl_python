@@ -61,6 +61,7 @@ def _fkl_version() -> str:
 class CompilerBackend:
     CLANG = "clang"
     NVCC = "nvcc"
+    CPU = "cpu"      # plain C++ (clang++/g++), ParArch::CPU, no CUDA at all
 
     def __init__(self, kind: str | None = None):
         self.kind = kind or self._auto()
@@ -108,8 +109,12 @@ class CompilerBackend:
         src_path = so.with_suffix(".cu")
         src_path.write_text(cu_source)
 
-        cmd = self._clang_cmd(src_path, so) if self.kind == self.CLANG \
-            else self._nvcc_cmd(src_path, so)
+        if self.kind == self.CPU:
+            cmd = self._cpu_cmd(src_path, so)
+        elif self.kind == self.CLANG:
+            cmd = self._clang_cmd(src_path, so)
+        else:
+            cmd = self._nvcc_cmd(src_path, so)
         proc = subprocess.run(cmd, capture_output=True, text=True)
 
         # Automatic fallback: clang's CUDA support can lag the installed CUDA
@@ -138,6 +143,21 @@ class CompilerBackend:
             )
         self._remember()
         return so
+
+    def _cpu_cmd(self, src: Path, so: Path):
+        # FKL's CPU path compiles as plain C++. NOTE: g++ rejects the
+        # Stream_<ParArch::CPU>() constructor spelling in stream.h; clang++
+        # accepts it, so CPU mode requires clang++.
+        cxx = shutil.which("clang++")
+        if cxx is None:
+            raise RuntimeError("CPU backend requires clang++ (g++ chokes on "
+                               "Stream_<ParArch::CPU>'s ctor spelling)")
+        cpp = src.with_suffix(".cpp")
+        if not cpp.exists():
+            cpp.write_text(src.read_text())
+        return [cxx, f"-std={_STD}", "-O2", "-shared", "-fPIC",
+                "-I", _FKL_INCLUDE, "-I", _FKL_ROOT,
+                str(cpp), "-o", str(so)]
 
     def _nvcc_cmd(self, src: Path, so: Path):
         nvcc = str(Path(_CUDA_HOME) / "bin" / "nvcc")

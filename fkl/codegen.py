@@ -21,7 +21,7 @@ from .operations import Op, ChainState, READ, WRITE
 from .types import DType
 
 # bump when generate_cu's emitted C++ changes for the SAME signature inputs
-CODEGEN_VERSION = 6
+CODEGEN_VERSION = 7
 
 
 def plan(ops: List[Op], in_dtype: DType, in_shape: Tuple[int, int, int],
@@ -67,7 +67,8 @@ def collect_params(ops: List[Op], in_dtype: DType,
 
 
 def generate_cu(ops: List[Op], in_dtype: DType,
-                in_shape: Tuple[int, int, int], n_inputs: int = 1) -> str:
+                in_shape: Tuple[int, int, int], n_inputs: int = 1,
+                target: str = "gpu", thread_fusion: bool = False) -> str:
     states, out_st = plan(ops, in_dtype, in_shape, n_inputs)
     in_st = states[0]
 
@@ -95,6 +96,9 @@ def generate_cu(ops: List[Op], in_dtype: DType,
 
     read_op, write_op = ops[0], ops[-1]
     in_t, out_t = in_st.dtype.ctype, out_st.dtype.ctype
+    MEM = "MemType::Device" if target == "gpu" else "MemType::Host"
+    DPP = ("TransformDPP<ParArch::GPU_NVIDIA, TF::ENABLED>" if thread_fusion
+           else "TransformDPP<>")
 
     # ---- IO construction (host) ----
     if read_op.name == "ReadSet":
@@ -107,26 +111,26 @@ def generate_cu(ops: List[Op], in_dtype: DType,
         packed_t = ops[0].out_dtype(in_st.dtype).ctype
         in_decl = (f"Tensor<{base_in}> input(({base_in}*)d_in, (uint)dims->in_w, "
                    f"(uint)dims->in_h, (uint)dims->in_planes, "
-                   f"(uint){ops[0]._ch}, MemType::Device);")
+                   f"(uint){ops[0]._ch}, {MEM});")
         read_expr = f"TensorPack<{packed_t}>::build(input)"
     elif n_inputs > 1:
         # HF over a batch of images: d_in is void** (array of device ptrs).
         # std::array<Ptr2D<T>, B> -> PerThreadRead<BatchRead> inside FKL.
         elems = ", ".join(
             f"Ptr2D<{in_t}>((({in_t}**)d_in)[{i}], (uint)dims->in_w, "
-            f"(uint)dims->in_h, (uint)(dims->in_w * sizeof({in_t})), MemType::Device)"
+            f"(uint)dims->in_h, (uint)(dims->in_w * sizeof({in_t})), {MEM})"
             for i in range(n_inputs))
         in_decl = (f"const std::array<Ptr2D<{in_t}>, {n_inputs}> "
                    f"input{{ {elems} }};")
         read_expr = f"PerThreadRead<ND::_2D, {in_t}>::build(input)"
     elif in_st.planes > 1:
         in_decl = (f"Tensor<{in_t}> input(({in_t}*)d_in, (uint)dims->in_w, "
-                   f"(uint)dims->in_h, (uint)dims->in_planes, 1, MemType::Device);")
+                   f"(uint)dims->in_h, (uint)dims->in_planes, 1, {MEM});")
         read_expr = f"TensorRead<{in_t}>::build(input)"
     else:
         in_decl = (f"Ptr2D<{in_t}> input(({in_t}*)d_in, (uint)dims->in_w, "
                    f"(uint)dims->in_h, (uint)(dims->in_w * sizeof({in_t})), "
-                   f"MemType::Device);")
+                   f"{MEM});")
         read_expr = f"PerThreadRead<ND::_2D, {in_t}>::build(input)"
 
     if write_op.name == "TensorSplit":
@@ -134,7 +138,7 @@ def generate_cu(ops: List[Op], in_dtype: DType,
         # planes = batch (thread.z); color_planes = channels (split offsets)
         out_decl = (f"Tensor<{base_t}> output(({base_t}*)d_out, (uint)dims->out_w, "
                     f"(uint)dims->out_h, (uint)dims->out_planes, "
-                    f"(uint){out_st.dtype.channels}, MemType::Device);")
+                    f"(uint){out_st.dtype.channels}, {MEM});")
         write_expr = f"TensorSplit<{out_t}>::build(output)"
     elif write_op.name == "TensorTSplit":
         base_t = out_st.dtype.base_ctype
@@ -159,18 +163,18 @@ def generate_cu(ops: List[Op], in_dtype: DType,
         ptrs = ", ".join(
             f"Ptr2D<{base_t}>((({base_t}*)d_out) + {c} * {plane}, "
             f"(uint)dims->out_w, (uint)dims->out_h, "
-            f"(uint)(dims->out_w * sizeof({base_t})), MemType::Device)"
+            f"(uint)(dims->out_w * sizeof({base_t})), {MEM})"
             for c in range(ch))
         out_decl = f"const std::vector<Ptr2D<{base_t}>> output{{ {ptrs} }};"
         write_expr = f"SplitWrite<ND::_2D, {out_t}>::build(output)"
     elif out_st.planes > 1:
         out_decl = (f"Tensor<{out_t}> output(({out_t}*)d_out, (uint)dims->out_w, "
-                    f"(uint)dims->out_h, (uint)dims->out_planes, 1, MemType::Device);")
+                    f"(uint)dims->out_h, (uint)dims->out_planes, 1, {MEM});")
         write_expr = f"TensorWrite<{out_t}>::build(output)"
     else:
         out_decl = (f"Ptr2D<{out_t}> output(({out_t}*)d_out, (uint)dims->out_w, "
                     f"(uint)dims->out_h, (uint)(dims->out_w * sizeof({out_t})), "
-                    f"MemType::Device);")
+                    f"{MEM});")
         write_expr = f"PerThreadWrite<ND::_2D, {out_t}>::build(output)"
 
     if fuse_with_read is not None:
@@ -191,6 +195,35 @@ def generate_cu(ops: List[Op], in_dtype: DType,
         all_iops = ",\n            ".join([head, *iop_exprs[1:], write_expr])
     else:
         all_iops = ",\n            ".join([read_expr, *iop_exprs, write_expr])
+
+    if target == "cpu":
+        return f"""// AUTO-GENERATED by fkl-python codegen v2 (CPU backend). Plain C++ TU.
+#include <fused_kernel/fused_kernel.h>
+#include <fused_kernel/core/execution_model/execution_model.h>
+#include <fused_kernel/algorithms/algorithms.h>
+
+using namespace fk;
+
+extern "C" {{
+struct FklDims {{
+    int in_w, in_h, in_planes;
+    int out_w, out_h, out_planes;
+}};
+
+void fkl_entry(void* d_in, void* d_out, const FklDims* dims,
+               const float* params, void* ext_stream)
+{{
+    (void)ext_stream;  // CPU executor is synchronous
+    {in_decl}
+    {out_decl}
+
+    Stream_<ParArch::CPU> stream;
+    executeOperations<TransformDPP<ParArch::CPU>>(stream,
+        {all_iops});
+    stream.sync();
+}}
+}} // extern "C"
+"""
 
     return f"""// AUTO-GENERATED by fkl-python codegen v2. Single-step host+device TU.
 #include <fused_kernel/fused_kernel.h>
@@ -213,12 +246,12 @@ void fkl_entry(void* d_in, void* d_out, const FklDims* dims,
 
     if (ext_stream != nullptr) {{
         Stream stream(reinterpret_cast<cudaStream_t>(ext_stream));
-        executeOperations<TransformDPP<>>(stream,
+        executeOperations<{DPP}>(stream,
             {all_iops});
         // caller owns the stream: stay async
     }} else {{
         static Stream stream;  // persistent: avoid create/destroy per call
-        executeOperations<TransformDPP<>>(stream,
+        executeOperations<{DPP}>(stream,
             {all_iops});
         stream.sync();
     }}

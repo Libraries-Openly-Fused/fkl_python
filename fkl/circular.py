@@ -2,15 +2,25 @@
 
 The only FKL feature that is NOT expressible as a chain op: it owns GPU
 state (the rolling tensor + a temp tensor + the rotation index) that
-persists across calls. Python holds an opaque handle to a heap-allocated
-C++ fk::CircularTensor; every update() is ONE fused kernel that:
+persists across calls. The generated .so holds a heap-allocated PyCT
+(data Tensor + temp Tensor + rotation idx) mirroring fk::CircularTensor's
+double-buffer design; every update() is ONE fused kernel that:
 
-  1. runs your preprocessing chain on the incoming frame and writes it
-     into the correct rotation slot, and
-  2. re-orders/copies the other BATCH-1 planes,
+  1. runs your preprocessing chain on the incoming frame, writes it into
+     the temp tensor's rotation slot (CircularTensorWrite) AND into the
+     newest data plane, and
+  2. rotate-copies the other BATCH-1 planes from temp into data
+     (CircularTensorRead with the order's direction),
 
-both as a Divergent HF kernel (two sequences selected per plane), exactly
-like the C++ `CircularTensor::update`.
+as a Divergent HF kernel: SequenceSelectorType routes plane z to sequence
+1 (update) or 2 (copy), grid.z = BATCH exactly.
+
+Why not call fk::CircularTensor::update directly: the Executor's
+getActiveThreads SUMS the z extents of all sequences (1 frame-read +
+BATCH circular-read = BATCH+1 planes) and the extra plane writes past the
+data tensor. Race-safety of our launch is auditable: the temp slot written
+by seq1 is never among the slots read by seq2 in the same launch, for both
+orders and every rotation index (see test_circular_tensor.py).
 
 Usage:
     ct = fkl.CircularTensor(64, 48, batch=4, dtype="uint8", channels=3,
@@ -27,12 +37,10 @@ from __future__ import annotations
 import ctypes
 
 from .backend import get_backend
-from .codegen import plan, CODEGEN_VERSION
-from .operations import READ, WRITE
+from .codegen import CODEGEN_VERSION
+from .operations import READ, WRITE, ChainState
 from .tensor import DeviceBuffer, as_device_view, stream_handle
 from .types import dtype as _dtype
-
-_ARCH_ENV = "FKL_ARCH"
 
 _ORDERS = {"newest_first": "CircularTensorOrder::NewestFirst",
            "oldest_first": "CircularTensorOrder::OldestFirst"}
@@ -43,7 +51,7 @@ class CircularTensor:
     def __init__(self, width: int, height: int, batch: int,
                  dtype="uint8", channels: int = 1,
                  order: str = "newest_first", layout: str = "packed",
-                 out_dtype=None):
+                 out_dtype=None, device: int = 0):
         if order not in _ORDERS:
             raise ValueError(f"order must be one of {tuple(_ORDERS)}")
         if layout not in _LAYOUTS:
@@ -59,6 +67,7 @@ class CircularTensor:
             self.store_dtype = self.store_dtype.with_channels(self.in_dtype.channels)
         self.width, self.height, self.batch = int(width), int(height), int(batch)
         self.order, self.layout = order, layout
+        self.device = int(device)
         self._lib = None
         self._handle = None
         self._chain_key = None
@@ -81,6 +90,9 @@ class CircularTensor:
             raise TypeError(f"frame dtype {v.dtype} != declared {self.in_dtype}")
 
         self._ensure_compiled(ops)
+        if self.device != 0:
+            DeviceBuffer._load_driver()
+            DeviceBuffer._activate(self.device)
         params = []
         shape = (self.width, self.height, 1)
         dt = self.in_dtype
@@ -103,10 +115,11 @@ class CircularTensor:
         if self.layout == "planar":
             out = DeviceBuffer(self.width, self.height,
                                self.store_dtype.base, channels=1,
-                               planes=self.batch * ch)
+                               planes=self.batch * ch, device=self.device)
         else:
             out = DeviceBuffer(self.width, self.height, self.store_dtype.base,
-                               channels=ch, planes=self.batch)
+                               channels=ch, planes=self.batch,
+                               device=self.device)
         self._lib.ct_snapshot(self._handle, ctypes.c_void_p(out.ptr),
                               ctypes.c_void_p(stream_handle(stream)))
         return out
@@ -131,14 +144,13 @@ class CircularTensor:
 
     # ---- compilation --------------------------------------------------------
 
-    def _ensure_compiled(self, ops):
-        from .jit import _ARCH
-        states = []
+    def _plan_chain(self, ops):
+        """Thread dtype/shape through the preproc chain; returns (states, key).
+        Raises if the chain output doesn't match the declared store dtype."""
+        states, toks = [], []
         dt = self.in_dtype
         shape = (self.width, self.height, 1)
-        toks = []
         for op in ops:
-            from .operations import ChainState
             st = ChainState(dt, *shape)
             states.append(st)
             if hasattr(op, "bind"):
@@ -149,7 +161,18 @@ class CircularTensor:
         if str(dt) != str(self.store_dtype):
             raise TypeError(f"preproc chain outputs {dt}, CircularTensor "
                             f"stores {self.store_dtype}")
-        key = "|".join(toks)
+        return states, "|".join(toks)
+
+    def generate_source(self, ops=None):
+        """Return the generated .cu for this CircularTensor + preproc chain
+        WITHOUT compiling (debugging / CI compile checks)."""
+        ops = list(ops or [])
+        states, _ = self._plan_chain(ops)
+        return self._generate_cu(ops, states)
+
+    def _ensure_compiled(self, ops):
+        from .jit import _ARCH
+        states, key = self._plan_chain(ops)
         if self._lib is not None and key == self._chain_key:
             return
         if self._lib is not None:
@@ -170,6 +193,9 @@ class CircularTensor:
         lib.ct_snapshot.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
                                     ctypes.c_void_p]
         lib.ct_destroy.argtypes = [ctypes.c_void_p]
+        if self.device != 0:
+            DeviceBuffer._load_driver()
+            DeviceBuffer._activate(self.device)   # PyCT allocates on current dev
         self._handle = lib.ct_create(self.width, self.height)
         if not self._handle:
             raise RuntimeError("ct_create failed")
@@ -195,14 +221,14 @@ class CircularTensor:
             w_op = f"TensorSplit<{store_t}>"
             r_op = f"TensorPack<{store_t}>"
             cp = ch
-            snap_bytes = (f"(size_t){self.width} * {self.height} * {B} * "
-                          f"{ch} * sizeof({base_t})")
+            snap_bytes = f"(size_t)ct->w * ct->h * {B} * {ch} * sizeof({base_t})"
+
         else:
             w_op = f"TensorWrite<{store_t}>"
             r_op = f"TensorRead<{store_t}>"
             cp = 1
-            snap_bytes = (f"(size_t){self.width} * {self.height} * {B} * "
-                          f"sizeof({store_t})")
+            snap_bytes = f"(size_t)ct->w * ct->h * {B} * sizeof({store_t})"
+
         tensor_t = base_t if self.layout == "planar" else store_t
 
         return f"""// AUTO-GENERATED by fkl-python (CircularTensor). Host+device TU.
@@ -230,10 +256,11 @@ using Selector = SequenceSelectorType<{order}, B>;
 struct PyCT {{
     TensorTy data;
     TensorTy temp;
+    uint w, h;
     int idx;
-    PyCT(uint w, uint h)
-        : data(w, h, B, {cp}, MemType::Device),
-          temp(w, h, B, {cp}, MemType::Device), idx(0) {{}}
+    PyCT(uint w_, uint h_)
+        : data(w_, h_, B, {cp}, MemType::Device),
+          temp(w_, h_, B, {cp}, MemType::Device), w(w_), h(h_), idx(0) {{}}
 }};
 
 template <typename Seq1, typename Seq2>
@@ -256,8 +283,8 @@ void* ct_create(int w, int h) {{
 
 void ct_update(void* h, void* d_frame, const float* params, void* ext_stream) {{
     PyCT* ct = (PyCT*)h;
-    Ptr2D<{in_t}> frame(({in_t}*)d_frame, (uint){self.width}, (uint){self.height},
-                        (uint)({self.width} * sizeof({in_t})), MemType::Device);
+    Ptr2D<{in_t}> frame(({in_t}*)d_frame, ct->w, ct->h,
+                        (uint)(ct->w * sizeof({in_t})), MemType::Device);
 
     MidWrite<CircularTensorWrite<CircularDirection::Ascendent, WOp, B>> toTemp;
     toTemp.params.first = ct->idx;
@@ -276,11 +303,11 @@ void ct_update(void* h, void* d_frame, const float* params, void* ext_stream) {{
     cudaStream_t s;
     if (ext_stream != nullptr) {{
         s = reinterpret_cast<cudaStream_t>(ext_stream);
-        launch_ct(seqUpdate, seqCopy, s, (uint){self.width}, (uint){self.height});
+        launch_ct(seqUpdate, seqCopy, s, ct->w, ct->h);
     }} else {{
         static Stream stream;
         s = stream.getCUDAStream();
-        launch_ct(seqUpdate, seqCopy, s, (uint){self.width}, (uint){self.height});
+        launch_ct(seqUpdate, seqCopy, s, ct->w, ct->h);
         stream.sync();
     }}
     ct->idx = (ct->idx + 1) % B;

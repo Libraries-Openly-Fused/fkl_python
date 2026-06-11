@@ -9,3 +9,5 @@ build/
 .venv/
 .cache/
 err.log
+examples/assets/
+.venv-yolo/

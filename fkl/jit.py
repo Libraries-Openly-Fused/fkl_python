@@ -36,24 +36,50 @@ class _FklDims(ctypes.Structure):
 
 class FusedKernel:
     """A composed chain. Compiles lazily on first call (input dtype/layout
-    is only known then) and caches per signature."""
+    is only known then) and caches per signature.
 
-    def __init__(self, ops: List[Op]):
+    target="gpu" (default) JITs a CUDA .so; target="cpu" JITs a plain C++
+    .so running FKL's ParArch::CPU executor on host memory (numpy in/out,
+    no CUDA required)."""
+
+    def __init__(self, ops: List[Op], target: str = "gpu",
+                 thread_fusion: bool = False):
         if not ops or ops[0].role != READ:
             raise ValueError("chain must start with TensorRead()")
         if ops[-1].role != WRITE:
             raise ValueError("chain must end with TensorWrite()/TensorSplit()")
+        if target not in ("gpu", "cpu"):
+            raise ValueError("target must be 'gpu' or 'cpu'")
         self.ops = ops
+        self.target = target
+        self.thread_fusion = bool(thread_fusion) and target == "gpu"
         self._variants = {}  # signature -> (entry fn, params buffer, out_state)
 
     # ---- compile path (cold, once per signature) --------------------------
+    def _tf_effective(self, dt: DType, shape) -> bool:
+        """ThreadFusion vectorizes row accesses (e.g. float4). With external
+        tight-pitched pointers every row must stay 16-byte aligned, i.e.
+        width * itemsize % 16 == 0. Otherwise fall back to the scalar DPP
+        for THIS shape (correctness first; the .so is per-signature)."""
+        if not self.thread_fusion:
+            return False
+        return (shape[0] * dt.itemsize) % 16 == 0
+
     def _get_variant(self, dt: DType, shape, n_inputs: int = 1):
-        sig = signature(self.ops, dt, shape, _ARCH, n_inputs)
+        arch = _ARCH if self.target == "gpu" else "host"
+        tf = self._tf_effective(dt, shape)
+        sig = (signature(self.ops, dt, shape, arch, n_inputs)
+               + f";t={self.target};tf={int(tf)}")
         hit = self._variants.get(sig)
         if hit is not None:
             return hit
-        cu = generate_cu(self.ops, dt, shape, n_inputs)
-        so = get_backend().compile(cu, sig)
+        cu = generate_cu(self.ops, dt, shape, n_inputs, target=self.target,
+                         thread_fusion=tf)
+        if self.target == "cpu":
+            from .backend import CompilerBackend
+            so = CompilerBackend(CompilerBackend.CPU).compile(cu, sig)
+        else:
+            so = get_backend().compile(cu, sig)
         lib = ctypes.CDLL(str(so))
         entry = lib.fkl_entry
         entry.restype = None
@@ -69,9 +95,16 @@ class FusedKernel:
 
     # ---- HOT PATH ----------------------------------------------------------
     def __call__(self, x, out=None, stream=None):
+        if self.target == "cpu":
+            return self._call_cpu(x, out)
         if isinstance(x, (list, tuple)):
             return self._call_batch(x, out, stream)
         vin: DeviceView = as_device_view(x)
+        if vin.device != 0:
+            # make the input's device current for the launch + output alloc
+            from .tensor import DeviceBuffer
+            DeviceBuffer._load_driver()
+            DeviceBuffer._activate(vin.device)
         in_shape = (vin.width, vin.height, vin.planes)
         entry, pbuf, out_st, _ = self._get_variant(vin.dtype, in_shape)
 
@@ -121,28 +154,69 @@ class FusedKernel:
         # caller keeping tensors alive for async streams (documented).
         return out
 
-    # ---- output allocation --------------------------------------------------
-    def _alloc_out(self, vin: DeviceView, out_st):
-        mod = type(vin.obj).__module__.split(".")[0]
+    def _call_cpu(self, x, out=None):
+        """CPU executor: numpy arrays in/out (host memory, synchronous)."""
+        import numpy as np
+        from .types import from_cai
+        x = np.ascontiguousarray(x)
+        ai = x.__array_interface__
+        dt, w, h, p = from_cai(ai["shape"], ai["typestr"])
+        entry, pbuf, out_st, _ = self._get_variant(dt, (w, h, p))
+
         ch = out_st.dtype.channels
-        if out_st.planes > 1:
+        is_split = self.ops[-1].name in ("TensorSplit", "TensorTSplit")
+        if is_split:
+            shape = ((out_st.planes if out_st.planes > 1 else 1) * ch,
+                     out_st.height, out_st.width)
+        elif out_st.planes > 1:
             shape = (out_st.planes, out_st.height, out_st.width) + ((ch,) if ch > 1 else ())
         elif out_st.height > 1:
             shape = (out_st.height, out_st.width) + ((ch,) if ch > 1 else ())
         else:
             shape = (out_st.width,) + ((ch,) if ch > 1 else ())
+        if out is None:
+            out = np.empty(shape, dtype=out_st.dtype.base)
+        out = np.ascontiguousarray(out)
+
+        dims = _FklDims(w, h, p, out_st.width, out_st.height, out_st.planes)
+        entry(ctypes.c_void_p(x.ctypes.data), ctypes.c_void_p(out.ctypes.data),
+              ctypes.byref(dims), ctypes.cast(pbuf, ctypes.c_void_p),
+              ctypes.c_void_p(0))
+        return out
+
+    # ---- output allocation --------------------------------------------------
+    def _alloc_out(self, vin: DeviceView, out_st):
+        mod = type(vin.obj).__module__.split(".")[0]
+        ch = out_st.dtype.channels
+        is_split = self.ops[-1].name in ("TensorSplit", "TensorTSplit")
+        if is_split:
+            # planar output: channels become leading planes (CHW / NCHW)
+            nplanes = (out_st.planes if out_st.planes > 1 else 1) * ch
+            shape = (nplanes, out_st.height, out_st.width)
+            alloc_dtype = out_st.dtype.base
+        elif out_st.planes > 1:
+            shape = (out_st.planes, out_st.height, out_st.width) + ((ch,) if ch > 1 else ())
+            alloc_dtype = out_st.dtype.base
+        elif out_st.height > 1:
+            shape = (out_st.height, out_st.width) + ((ch,) if ch > 1 else ())
+            alloc_dtype = out_st.dtype.base
+        else:
+            shape = (out_st.width,) + ((ch,) if ch > 1 else ())
+            alloc_dtype = out_st.dtype.base
         if mod == "torch":
             import torch
             tmap = {"float32": torch.float32, "float64": torch.float64,
                     "uint8": torch.uint8, "int32": torch.int32,
                     "int16": torch.int16, "uint16": torch.uint16,
                     "int8": torch.int8}
-            return torch.empty(shape, device="cuda", dtype=tmap[out_st.dtype.base])
+            return torch.empty(shape, device=f"cuda:{vin.device}",
+                               dtype=tmap[out_st.dtype.base])
         if mod == "cupy":
             import cupy
-            return cupy.empty(shape, dtype=out_st.dtype.base)
+            with cupy.cuda.Device(vin.device):
+                return cupy.empty(shape, dtype=out_st.dtype.base)
         from .tensor import DeviceBuffer
-        return DeviceBuffer.from_state(out_st)
+        return DeviceBuffer.from_state(out_st, device=vin.device)
 
     def source_for(self, dtype_spec, shape):
         """Debug: show the generated C++ for a given input."""
@@ -150,8 +224,12 @@ class FusedKernel:
         return generate_cu(self.ops, _d(dtype_spec), tuple(shape))
 
 
-def compose(*ops: Op) -> FusedKernel:
-    return FusedKernel(list(ops))
+def compose(*ops: Op, target: str = "gpu",
+            thread_fusion: bool = False) -> FusedKernel:
+    """thread_fusion=True enables FKL's ThreadFusion (TF::ENABLED):
+    each thread processes multiple elements with vectorized accesses.
+    GPU-only; best for wide images with simple per-pixel chains."""
+    return FusedKernel(list(ops), target=target, thread_fusion=thread_fusion)
 
 
 # ===================== Divergent Horizontal Fusion ========================
