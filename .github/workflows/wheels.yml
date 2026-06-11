@@ -1,0 +1,152 @@
+name: wheels
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to attach wheels to GitHub Releases on tags
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check metadata
+        run: twine check dist/*
+
+      - name: Smoke-test wheel install + import surface
+        run: |
+          python -m pip install dist/*.whl
+          python - <<'EOF'
+          # Import must work WITHOUT CUDA/FKL present (lazy backend init).
+          import fkl
+          expected = {"compose", "compose_divergent", "CircularTensor",
+                      "TensorRead", "TensorWrite", "Crop", "Resize",
+                      "Warping", "Mul", "Add", "DeviceBuffer"}
+          missing = expected - set(fkl.__all__)
+          assert not missing, f"missing exports: {missing}"
+          print("import OK,", len(fkl.__all__), "public symbols, v", fkl.__version__)
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  # Compile-check the JIT codegen against real FKL headers + CUDA toolkit
+  # (no GPU needed: we only verify the generated .cu compiles to a .so).
+  codegen-compile-check:
+    name: Codegen compile check (CUDA ${{ matrix.cuda }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ["12.6.3", "13.1.1"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CUDA toolkit (nvcc, headers)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ matrix.cuda }}
+          method: network
+          sub-packages: '["nvcc", "cudart-dev"]'
+
+      - name: Clone FusedKernelLibrary (LTS-C++17)
+        run: |
+          git clone --depth 1 --branch LTS-C++17 \
+            https://github.com/Libraries-Openly-Fused/FusedKernelLibrary.git \
+            "$RUNNER_TEMP/FKL"
+
+      - name: Compile generated kernels (no GPU)
+        env:
+          FKL_INCLUDE: ${{ runner.temp }}/FKL/include
+          FKL_ROOT: ${{ runner.temp }}/FKL
+          FKL_ARCH: sm_90
+        run: |
+          export PYTHONPATH="$PWD"
+          python - <<'EOF'
+          """Generate the .cu for representative chains and nvcc-compile them.
+          Covers VF, BVF (crop+resize), HF (batch crops + batch images),
+          vector dtypes and TensorSplit, without needing a GPU."""
+          import os, subprocess, tempfile
+          import fkl
+          from fkl.codegen import generate_cu
+          from fkl.types import dtype
+
+          CASES = [
+              ("vf_f32",    [fkl.TensorRead(), fkl.Mul(2.0), fkl.Add(1.0),
+                             fkl.TensorWrite()], dtype("float32"), (64, 32, 1), 1),
+              ("bvf_u8c3",  [fkl.TensorRead(), fkl.Crop(4, 4, 32, 32),
+                             fkl.Resize(16, 16), fkl.Sub((1.0, 1.0, 1.0)),
+                             fkl.SaturateCast("uint8"), fkl.TensorWrite()],
+                             dtype("uint8").with_channels(3), (64, 48, 1), 1),
+              ("hf_crops",  [fkl.TensorRead(),
+                             fkl.Crop([(0, 0, 8, 8), (8, 8, 8, 8)]),
+                             fkl.Mul(0.5), fkl.TensorWrite()],
+                             dtype("float32"), (32, 32, 1), 1),
+              ("hf_batch",  [fkl.TensorRead(), fkl.Add(1.0), fkl.TensorWrite()],
+                             dtype("float32"), (32, 16, 1), 3),
+              ("split_u8c3", [fkl.TensorRead(), fkl.Cast("float32"),
+                              fkl.Div(255.0), fkl.TensorSplit()],
+                              dtype("uint8").with_channels(3), (16, 8, 1), 1),
+          ]
+
+          fklroot = os.environ["FKL_ROOT"]
+          inc = os.environ["FKL_INCLUDE"]
+          arch = os.environ.get("FKL_ARCH", "sm_90")
+          failed = []
+          for name, ops, dt, shape, n in CASES:
+              cu = generate_cu(ops, dt, shape, n)
+              with tempfile.NamedTemporaryFile("w", suffix=".cu", delete=False) as f:
+                  f.write(cu); path = f.name
+              r = subprocess.run(
+                  ["nvcc", "-std=c++20", f"-arch={arch}", "-shared",
+                   "-Xcompiler", "-fPIC", f"-I{inc}", f"-I{fklroot}",
+                   path, "-o", path + ".so"],
+                  capture_output=True, text=True)
+              status = "OK" if r.returncode == 0 else "FAIL"
+              print(f"{name}: {status}")
+              if r.returncode != 0:
+                  print(r.stderr[-3000:])
+                  failed.append(name)
+          assert not failed, f"codegen compile failures: {failed}"
+          print("all codegen cases compiled")
+          EOF
+
+  release:
+    name: Attach wheels to release
+    needs: [build, codegen-compile-check]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create GitHub Release with artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fkl-python"
+version = "0.6.0"
+description = "Zero-overhead Python front-end for the Fused Kernel Library (FKL): compose fused GPU kernels (Vertical, Backwards Vertical, Horizontal and Divergent Horizontal Fusion) from Python with a JIT clang/nvcc backend and DLPack interop."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Oscar Amoros Huguet" },
+    { name = "Johnny Nunez", email = "johnnynuca14@gmail.com" },
+]
+keywords = ["cuda", "gpu", "kernel-fusion", "jit", "image-processing", "dlpack"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Compilers",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = []   # core has NO python deps (uses ctypes + CUDA driver)
+
+[project.optional-dependencies]
+torch = ["torch"]
+cupy = ["cupy-cuda12x"]
+
+[project.urls]
+Homepage = "https://github.com/johnnynunez/fkl_python"
+Repository = "https://github.com/johnnynunez/fkl_python"
+"FKL (C++ library)" = "https://github.com/Libraries-Openly-Fused/FusedKernelLibrary"
+"Paper" = "https://arxiv.org/abs/2508.07071"
+
+[tool.setuptools.packages.find]
+include = ["fkl*"]
+
+# Environment variables understood at runtime:
+#   FKL_INCLUDE  path to FusedKernelLibrary/include   (required)
+#   FKL_ROOT     path to FusedKernelLibrary repo root (required)
+#   CUDA_HOME    path to CUDA toolkit  (default /usr/local/cuda)
+#   FKL_ARCH     GPU arch              (default sm_120)
+#   FKL_STD      C++ standard          (default c++20)
+#   FKL_CACHE    compiled .so cache    (default ~/.cache/fkl)
