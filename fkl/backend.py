@@ -19,17 +19,84 @@ from pathlib import Path
 
 # ---- configuration -------------------------------------------------------
 
-_FKL_INCLUDE = os.environ.get(
-    "FKL_INCLUDE",
-    "/home/johnny/Projects/oscar/FusedKernelLibrary/include",
-)
-_FKL_ROOT = os.environ.get(
-    "FKL_ROOT",
-    "/home/johnny/Projects/oscar/FusedKernelLibrary",
-)
-_CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+def _resolve_fkl_include() -> str:
+    """FKL headers resolution, in priority order:
+    1. FKL_INCLUDE env var (explicit override / developer checkout)
+    2. vendored headers shipped inside the wheel (fkl/_vendor/...)
+    3. well-known sibling checkout (development convenience)
+    """
+    env = os.environ.get("FKL_INCLUDE")
+    if env:
+        return env
+    vendored = Path(__file__).parent / "_vendor" / "FusedKernelLibrary" / "include"
+    if (vendored / "fused_kernel" / "fused_kernel.h").exists():
+        return str(vendored)
+    dev = Path.home() / "Projects" / "oscar" / "FusedKernelLibrary" / "include"
+    if (dev / "fused_kernel" / "fused_kernel.h").exists():
+        return str(dev)
+    raise RuntimeError(
+        "FusedKernelLibrary headers not found. Either:\n"
+        "  - pip install a wheel with vendored headers (run scripts/vendor_fkl.py"
+        " before building), or\n"
+        "  - set FKL_INCLUDE to <FusedKernelLibrary>/include")
+
+
+_FKL_INCLUDE = None  # resolved lazily on first compile (import must not fail)
+
+
+def fkl_include() -> str:
+    global _FKL_INCLUDE
+    if _FKL_INCLUDE is None:
+        _FKL_INCLUDE = _resolve_fkl_include()
+    return _FKL_INCLUDE
+
+
+def fkl_root() -> str:
+    # FKL_ROOT is only needed for in-repo test utilities (<tests/main.h>);
+    # generated chains only need include/. Default: include's parent.
+    return os.environ.get("FKL_ROOT", str(Path(fkl_include()).parent))
+
+
+def _detect_cuda_home() -> str:
+    env = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if env:
+        return env
+    if Path("/usr/local/cuda").exists():
+        return "/usr/local/cuda"
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        return str(Path(nvcc).parent.parent)
+    return "/usr/local/cuda"  # last resort; clear error surfaces at compile
+
+
+_CUDA_HOME = _detect_cuda_home()
 _CACHE_DIR = Path(os.environ.get("FKL_CACHE", str(Path.home() / ".cache" / "fkl")))
-_ARCH = os.environ.get("FKL_ARCH", "sm_120")
+def _detect_arch() -> str:
+    """GPU arch resolution for plug-and-play installs:
+    1. FKL_ARCH env var (explicit override)
+    2. compute capability of GPU 0 via the CUDA driver API (ctypes; no
+       dependencies; works without nvcc/nvidia-smi on PATH)
+    3. sm_75 floor as a last resort (compiles everywhere Turing+)
+    """
+    env = os.environ.get("FKL_ARCH")
+    if env:
+        return env
+    try:
+        import ctypes
+        cuda = ctypes.CDLL("libcuda.so.1")
+        if cuda.cuInit(0) == 0:
+            major, minor, dev = ctypes.c_int(), ctypes.c_int(), ctypes.c_int()
+            if cuda.cuDeviceGet(ctypes.byref(dev), 0) == 0:
+                cuda.cuDeviceGetAttribute(ctypes.byref(major), 75, dev)   # COMPUTE_CAPABILITY_MAJOR
+                cuda.cuDeviceGetAttribute(ctypes.byref(minor), 76, dev)   # COMPUTE_CAPABILITY_MINOR
+                if major.value > 0:
+                    return f"sm_{major.value}{minor.value}"
+    except Exception:
+        pass
+    return "sm_75"
+
+
+_ARCH = _detect_arch()
 _STD = os.environ.get("FKL_STD", "c++20")
 
 
@@ -50,7 +117,7 @@ def _cuda_version() -> str:
 def _fkl_version() -> str:
     # cheap content fingerprint of the public header to invalidate cache on bumps
     h = hashlib.sha1()
-    fk_h = Path(_FKL_INCLUDE) / "fused_kernel" / "fused_kernel.h"
+    fk_h = Path(fkl_include()) / "fused_kernel" / "fused_kernel.h"
     try:
         h.update(fk_h.read_bytes())
     except Exception:
@@ -156,7 +223,7 @@ class CompilerBackend:
         if not cpp.exists():
             cpp.write_text(src.read_text())
         return [cxx, f"-std={_STD}", "-O2", "-shared", "-fPIC",
-                "-I", _FKL_INCLUDE, "-I", _FKL_ROOT,
+                "-I", fkl_include(), "-I", fkl_root(),
                 str(cpp), "-o", str(so)]
 
     def _nvcc_cmd(self, src: Path, so: Path):
@@ -164,7 +231,7 @@ class CompilerBackend:
         return [
             nvcc, f"-std={_STD}", f"-arch={_ARCH}",
             "-shared", "-Xcompiler", "-fPIC",
-            "-I", _FKL_INCLUDE, "-I", _FKL_ROOT,
+            "-I", fkl_include(), "-I", fkl_root(),
             str(src), "-o", str(so),
         ]
 
@@ -178,7 +245,7 @@ class CompilerBackend:
             # clang's wrapper chain leaves undefined -> define it explicitly.
             "-D_NV_RSQRT_SPECIFIER=noexcept(true)",
             "-shared", "-fPIC",
-            "-I", _FKL_INCLUDE, "-I", _FKL_ROOT,
+            "-I", fkl_include(), "-I", fkl_root(),
             str(src), "-o", str(so),
             f"-L{_CUDA_HOME}/lib64", "-lcudart",
         ]

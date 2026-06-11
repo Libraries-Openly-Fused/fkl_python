@@ -24,6 +24,9 @@ jobs:
       - name: Install build tooling
         run: python -m pip install --upgrade build twine
 
+      - name: Vendor FKL headers (self-contained wheel)
+        run: python scripts/vendor_fkl.py --ref LTS-C++17
+
       - name: Build sdist and wheel
         run: python -m build
 
@@ -34,8 +37,13 @@ jobs:
         run: |
           python -m pip install dist/*.whl
           python - <<'EOF'
-          # Import must work WITHOUT CUDA/FKL present (lazy backend init).
+          # Import must work WITHOUT CUDA present (lazy backend init).
           import fkl
+          # vendored headers must be inside the installed wheel
+          from pathlib import Path
+          vend = Path(fkl.__file__).parent / "_vendor" / "FusedKernelLibrary" / "include" / "fused_kernel" / "fused_kernel.h"
+          assert vend.exists(), f"vendored headers missing: {vend}"
+          print("vendored FKL headers present in wheel")
           expected = {"compose", "compose_divergent", "CircularTensor",
                       "TensorRead", "TensorWrite", "Crop", "Resize",
                       "Warping", "Mul", "Add", "DeviceBuffer"}

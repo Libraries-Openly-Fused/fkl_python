@@ -58,13 +58,32 @@ No torch? Use the built-in dependency-free `DeviceBuffer` (CUDA driver via ctype
 
 ## Setup
 
+### Plug and play (wheel with vendored headers)
+
 ```bash
-export FKL_INCLUDE=/path/to/FusedKernelLibrary/include
-export FKL_ROOT=/path/to/FusedKernelLibrary
-export FKL_ARCH=sm_120          # your GPU arch
+pip install fkl-python      # once published; or the wheel from GitHub Releases
+python -c "import fkl; ..."  # just works: no env vars, no FKL checkout
+```
+
+The wheel ships the FKL headers inside (`fkl/_vendor/`, header-only,
+Apache-2.0, upstream commit recorded in `VENDOR_INFO.txt`). At first use it
+auto-detects your GPU arch (CUDA driver API) and CUDA toolkit, JIT-compiles
+the chain, and caches the .so under `~/.cache/fkl`. Requirements on the
+machine: an NVIDIA driver + a CUDA toolkit (nvcc) or clang++.
+
+### Development (use your own FKL checkout)
+
+```bash
+export FKL_INCLUDE=/path/to/FusedKernelLibrary/include   # overrides vendored
+export FKL_ARCH=sm_120                                   # optional override
 pip install -e .
 python tests/test_e2e.py
 ```
+
+Resolution order: `FKL_INCLUDE` env var > vendored headers in the wheel >
+sibling dev checkout. Arch: `FKL_ARCH` > driver query of GPU 0 > sm_75.
+To (re)vendor headers before building a wheel:
+`python scripts/vendor_fkl.py --ref LTS-C++17`.
 
 ## Status
 
