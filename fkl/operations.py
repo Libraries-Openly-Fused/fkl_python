@@ -366,21 +366,58 @@ class Resize(Op):
 # ===================== memory ops =========================================
 
 class _ReadOp(Op):
+    """A chain-head memory Read IOp.
+
+    Owns its own host-side IO construction via emit_read(): it returns the
+    C++ declaration of the input buffer object plus the build() expression
+    that consumes it. Keeping this on the descriptor (instead of a closed
+    if/elif ladder in codegen) means a Read IOp is self-contained — exactly
+    how the C++ side carries the read in its IOp type. emit_read is the read
+    counterpart to cpp() for COMPUTE ops.
+    """
     role = READ
+
+    def emit_read(self, state, mem, n_inputs):
+        """-> (in_decl, read_expr). in_decl declares the host buffer object
+        from d_in/dims; read_expr is the FKL build() that consumes it."""
+        raise NotImplementedError(f"{self.name} does not implement emit_read")
 
 
 class _WriteOp(Op):
+    """A chain-tail memory Write IOp. emit_write() is the write counterpart
+    to _ReadOp.emit_read()."""
     role = WRITE
+
+    def emit_write(self, state, mem, pbase):
+        """-> (out_decl, write_expr). out_decl declares the host output
+        buffer object from d_out/dims; write_expr is the build() consuming it."""
+        raise NotImplementedError(f"{self.name} does not implement emit_write")
 
 
 class TensorRead(_ReadOp):
-    """Read input. 2D Ptr2D -> PerThreadRead<_2D>; 3D Tensor -> TensorRead."""
+    """Read input. 2D Ptr2D -> PerThreadRead<_2D>; 3D Tensor -> TensorRead;
+    batch of B same-size 2D images -> std::array<Ptr2D,B> -> PerThreadRead
+    (BatchRead under the hood, the HF read)."""
     name = "TensorRead"
 
-    def cpp(self, state, pbase):
+    def emit_read(self, state, mem, n_inputs):
+        t = state.dtype.ctype
+        if n_inputs > 1:
+            # HF over a batch of images: d_in is void** (array of device ptrs).
+            elems = ", ".join(
+                f"Ptr2D<{t}>((({t}**)d_in)[{i}], (uint)dims->in_w, "
+                f"(uint)dims->in_h, (uint)(dims->in_w * sizeof({t})), {mem})"
+                for i in range(n_inputs))
+            decl = (f"const std::array<Ptr2D<{t}>, {n_inputs}> "
+                    f"input{{ {elems} }};")
+            return decl, f"PerThreadRead<ND::_2D, {t}>::build(input)"
         if state.planes > 1:
-            return f"TensorRead<{state.dtype}>::build(in_tensor)"
-        return f"PerThreadRead<ND::_2D, {state.dtype}>::build(input.ptr())"
+            decl = (f"Tensor<{t}> input(({t}*)d_in, (uint)dims->in_w, "
+                    f"(uint)dims->in_h, (uint)dims->in_planes, 1, {mem});")
+            return decl, f"TensorRead<{t}>::build(input)"
+        decl = (f"Ptr2D<{t}> input(({t}*)d_in, (uint)dims->in_w, "
+                f"(uint)dims->in_h, (uint)(dims->in_w * sizeof({t})), {mem});")
+        return decl, f"PerThreadRead<ND::_2D, {t}>::build(input)"
 
     def token(self, state):
         return f"Read<{state.dtype},p{state.planes}>"
@@ -389,10 +426,15 @@ class TensorRead(_ReadOp):
 class TensorWrite(_WriteOp):
     name = "TensorWrite"
 
-    def cpp(self, state, pbase):
+    def emit_write(self, state, mem, pbase):
+        t = state.dtype.ctype
         if state.planes > 1:
-            return f"TensorWrite<{state.dtype}>::build(out_tensor)"
-        return f"PerThreadWrite<ND::_2D, {state.dtype}>::build(output.ptr())"
+            decl = (f"Tensor<{t}> output(({t}*)d_out, (uint)dims->out_w, "
+                    f"(uint)dims->out_h, (uint)dims->out_planes, 1, {mem});")
+            return decl, f"TensorWrite<{t}>::build(output)"
+        decl = (f"Ptr2D<{t}> output(({t}*)d_out, (uint)dims->out_w, "
+                f"(uint)dims->out_h, (uint)(dims->out_w * sizeof({t})), {mem});")
+        return decl, f"PerThreadWrite<ND::_2D, {t}>::build(output)"
 
     def token(self, state):
         return f"Write<{state.dtype},p{state.planes}>"
@@ -400,14 +442,19 @@ class TensorWrite(_WriteOp):
 
 class TensorSplit(_WriteOp):
     """Write vector pixels as separate planes (planar layout for DNNs).
-    uchar3 HxW -> 3 planes of HxW uchar."""
+    uchar3 HxW -> 3 planes of HxW uchar. planes = batch (thread.z);
+    color_planes = channels (split offsets)."""
     name = "TensorSplit"
 
     def out_shape(self, shape):
         return shape  # planes encoded by channels at alloc time
 
-    def cpp(self, state, pbase):
-        return f"TensorSplit<{state.dtype}>::build(out_tensor)"
+    def emit_write(self, state, mem, pbase):
+        base_t = state.dtype.base_ctype
+        decl = (f"Tensor<{base_t}> output(({base_t}*)d_out, (uint)dims->out_w, "
+                f"(uint)dims->out_h, (uint)dims->out_planes, "
+                f"(uint){state.dtype.channels}, {mem});")
+        return decl, f"TensorSplit<{state.dtype}>::build(output)"
 
     def token(self, state):
         return f"TensorSplit<{state.dtype}>"
@@ -552,8 +599,17 @@ class SplitWrite(_WriteOp):
     contiguously (like TensorSplit but via SplitWrite params)."""
     name = "SplitWrite"
 
-    def cpp(self, state, pbase):
-        return None  # constructed by codegen from output pointer
+    def emit_write(self, state, mem, pbase):
+        base_t = state.dtype.base_ctype
+        ch = state.dtype.channels
+        plane = "(dims->out_w * dims->out_h)"
+        ptrs = ", ".join(
+            f"Ptr2D<{base_t}>((({base_t}*)d_out) + {c} * {plane}, "
+            f"(uint)dims->out_w, (uint)dims->out_h, "
+            f"(uint)(dims->out_w * sizeof({base_t})), {mem})"
+            for c in range(ch))
+        decl = f"const std::vector<Ptr2D<{base_t}>> output{{ {ptrs} }};"
+        return decl, f"SplitWrite<ND::_2D, {state.dtype}>::build(output)"
 
     def token(self, state):
         return f"SplitWrite<{state.dtype}>"
@@ -620,6 +676,11 @@ class ReadSet(_ReadOp):
               f"(uint)params[{pbase + n + 1}], 1u)")
         return f"ReadSet<{self._dt}>::build({val}, {at})"
 
+    def emit_read(self, state, mem, n_inputs):
+        # constant generator: no input pointer at all. Read params live at
+        # the head of params[] (pbase 0), like any chain-head op.
+        return "// ReadSet: no DRAM input", self.cpp(state, 0)
+
     def token(self, state):
         return f"ReadSet<{self._dt}>"
 
@@ -637,8 +698,13 @@ class TensorPack(_ReadOp):
     def out_dtype(self, dt):
         return dt.with_channels(self._ch)
 
-    def cpp(self, state, pbase):
-        return None  # built by codegen from the input pointer
+    def emit_read(self, state, mem, n_inputs):
+        base_in = state.dtype.base_ctype
+        packed_t = self.out_dtype(state.dtype).ctype
+        decl = (f"Tensor<{base_in}> input(({base_in}*)d_in, (uint)dims->in_w, "
+                f"(uint)dims->in_h, (uint)dims->in_planes, "
+                f"(uint){self._ch}, {mem});")
+        return decl, f"TensorPack<{packed_t}>::build(input)"
 
     def token(self, state):
         return f"TensorPack<{state.dtype}c{self._ch}>"
@@ -649,8 +715,22 @@ class TensorTSplit(_WriteOp):
     layout [C][planes][H][W] instead of TensorSplit's [planes][C][H][W]."""
     name = "TensorTSplit"
 
-    def cpp(self, state, pbase):
-        return None  # built by codegen from the output pointer
+    def emit_write(self, state, mem, pbase):
+        base_t = state.dtype.base_ctype
+        ch = state.dtype.channels
+        # TensorT's (data, w, h, planes, cp) ctor leaves pitches at 0 (they
+        # are only filled by h_malloc_init on allocation). For an external
+        # pointer, build the RawPtr<T3D> with explicit pitches and pass it
+        # straight to build(params).
+        pitch = f"(uint)(dims->out_w * sizeof({base_t}))"
+        decl = (
+            f"PtrDims<ND::T3D> outDims((uint)dims->out_w, (uint)dims->out_h, "
+            f"(uint)dims->out_planes, (uint){ch});\n"
+            f"    outDims.pitch = {pitch};\n"
+            f"    outDims.plane_pitch = outDims.pitch * outDims.height;\n"
+            f"    outDims.color_planes_pitch = outDims.plane_pitch * outDims.planes;\n"
+            f"    RawPtr<ND::T3D, {base_t}> outRaw{{ ({base_t}*)d_out, outDims }};")
+        return decl, f"TensorTSplit<{state.dtype}>::build(outRaw)"
 
     def token(self, state):
         return f"TensorTSplit<{state.dtype}>"
