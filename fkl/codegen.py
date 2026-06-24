@@ -21,7 +21,7 @@ from .operations import Op, ChainState, READ, WRITE
 from .types import DType
 
 # bump when generate_cu's emitted C++ changes for the SAME signature inputs
-CODEGEN_VERSION = 7
+CODEGEN_VERSION = 8
 
 
 def plan(ops: List[Op], in_dtype: DType, in_shape: Tuple[int, int, int],
@@ -72,116 +72,47 @@ def generate_cu(ops: List[Op], in_dtype: DType,
     states, out_st = plan(ops, in_dtype, in_shape, n_inputs)
     in_st = states[0]
 
-    # emit build() expressions for everything except read/write (those are
-    # constructed from the IO pointers below)
+    # emit build() expressions for everything except read/write. The read
+    # and write IOps construct their OWN host-side IO objects via
+    # emit_read()/emit_write() (the IO is part of the IOp, mirroring how the
+    # C++ side carries the buffer inside the read/write IOp type) instead of
+    # a closed if/elif ladder here.
     iop_exprs = []
     batch_fuse_head = False  # batch ReadBack ops need explicit fuse() w/ read
-    fuse_with_read = None    # op that consumes the read expr (BorderReader)
+    needs_read = None        # op requiring the read spliced in (CONSTANT border)
     pbase = 0
+    pbase_by_op = []
     for op, st in zip(ops, states):
         if hasattr(op, "bind"):
             op.bind(st.dtype)
-        nvals = len(op.values)
+        pbase_by_op.append(pbase)
         if op.role not in (READ, WRITE):
-            if getattr(op, "_fuse_with_read", False):
-                if fuse_with_read is not None:
-                    raise ValueError("only one read-fusing op per chain")
-                fuse_with_read = (op, st, pbase)
+            if getattr(op, "_needs_read", False):
+                if needs_read is not None:
+                    raise ValueError("only one read-splicing op per chain")
+                needs_read = (op, st, pbase)
                 iop_exprs.append(None)  # placeholder, filled below
             else:
                 iop_exprs.append(op.cpp(st, pbase))
                 if getattr(op, "_batch", False):
                     batch_fuse_head = True
-        pbase += nvals
+        pbase += len(op.values)
 
     read_op, write_op = ops[0], ops[-1]
-    in_t, out_t = in_st.dtype.ctype, out_st.dtype.ctype
     MEM = "MemType::Device" if target == "gpu" else "MemType::Host"
     DPP = ("TransformDPP<ParArch::GPU_NVIDIA, TF::ENABLED>" if thread_fusion
            else "TransformDPP<>")
 
-    # ---- IO construction (host) ----
-    if read_op.name == "ReadSet":
-        # constant generator: no input pointer at all
-        in_decl = "// ReadSet: no DRAM input"
-        read_expr = ops[0].cpp(in_st, 0)
-    elif read_op.name == "TensorPack":
-        # planar (CHW) input read back as packed vector pixels
-        base_in = in_st.dtype.base_ctype
-        packed_t = ops[0].out_dtype(in_st.dtype).ctype
-        in_decl = (f"Tensor<{base_in}> input(({base_in}*)d_in, (uint)dims->in_w, "
-                   f"(uint)dims->in_h, (uint)dims->in_planes, "
-                   f"(uint){ops[0]._ch}, {MEM});")
-        read_expr = f"TensorPack<{packed_t}>::build(input)"
-    elif n_inputs > 1:
-        # HF over a batch of images: d_in is void** (array of device ptrs).
-        # std::array<Ptr2D<T>, B> -> PerThreadRead<BatchRead> inside FKL.
-        elems = ", ".join(
-            f"Ptr2D<{in_t}>((({in_t}**)d_in)[{i}], (uint)dims->in_w, "
-            f"(uint)dims->in_h, (uint)(dims->in_w * sizeof({in_t})), {MEM})"
-            for i in range(n_inputs))
-        in_decl = (f"const std::array<Ptr2D<{in_t}>, {n_inputs}> "
-                   f"input{{ {elems} }};")
-        read_expr = f"PerThreadRead<ND::_2D, {in_t}>::build(input)"
-    elif in_st.planes > 1:
-        in_decl = (f"Tensor<{in_t}> input(({in_t}*)d_in, (uint)dims->in_w, "
-                   f"(uint)dims->in_h, (uint)dims->in_planes, 1, {MEM});")
-        read_expr = f"TensorRead<{in_t}>::build(input)"
-    else:
-        in_decl = (f"Ptr2D<{in_t}> input(({in_t}*)d_in, (uint)dims->in_w, "
-                   f"(uint)dims->in_h, (uint)(dims->in_w * sizeof({in_t})), "
-                   f"{MEM});")
-        read_expr = f"PerThreadRead<ND::_2D, {in_t}>::build(input)"
+    # ---- IO construction (host): delegated to the read/write IOps ----
+    in_decl, read_expr = read_op.emit_read(in_st, MEM, n_inputs)
+    out_decl, write_expr = write_op.emit_write(out_st, MEM, pbase_by_op[-1])
 
-    if write_op.name == "TensorSplit":
-        base_t = out_st.dtype.base_ctype
-        # planes = batch (thread.z); color_planes = channels (split offsets)
-        out_decl = (f"Tensor<{base_t}> output(({base_t}*)d_out, (uint)dims->out_w, "
-                    f"(uint)dims->out_h, (uint)dims->out_planes, "
-                    f"(uint){out_st.dtype.channels}, {MEM});")
-        write_expr = f"TensorSplit<{out_t}>::build(output)"
-    elif write_op.name == "TensorTSplit":
-        base_t = out_st.dtype.base_ctype
-        ch = out_st.dtype.channels
-        # TensorT's (data, w, h, planes, cp) ctor leaves pitches at 0 (they
-        # are only filled by h_malloc_init on allocation). For an external
-        # pointer, build the RawPtr<T3D> with explicit pitches and pass it
-        # straight to build(params).
-        pitch = f"(uint)(dims->out_w * sizeof({base_t}))"
-        out_decl = (
-            f"PtrDims<ND::T3D> outDims((uint)dims->out_w, (uint)dims->out_h, "
-            f"(uint)dims->out_planes, (uint){ch});\n"
-            f"    outDims.pitch = {pitch};\n"
-            f"    outDims.plane_pitch = outDims.pitch * outDims.height;\n"
-            f"    outDims.color_planes_pitch = outDims.plane_pitch * outDims.planes;\n"
-            f"    RawPtr<ND::T3D, {base_t}> outRaw{{ ({base_t}*)d_out, outDims }};")
-        write_expr = f"TensorTSplit<{out_t}>::build(outRaw)"
-    elif write_op.name == "SplitWrite":
-        base_t = out_st.dtype.base_ctype
-        ch = out_st.dtype.channels
-        plane = f"(dims->out_w * dims->out_h)"
-        ptrs = ", ".join(
-            f"Ptr2D<{base_t}>((({base_t}*)d_out) + {c} * {plane}, "
-            f"(uint)dims->out_w, (uint)dims->out_h, "
-            f"(uint)(dims->out_w * sizeof({base_t})), {MEM})"
-            for c in range(ch))
-        out_decl = f"const std::vector<Ptr2D<{base_t}>> output{{ {ptrs} }};"
-        write_expr = f"SplitWrite<ND::_2D, {out_t}>::build(output)"
-    elif out_st.planes > 1:
-        out_decl = (f"Tensor<{out_t}> output(({out_t}*)d_out, (uint)dims->out_w, "
-                    f"(uint)dims->out_h, (uint)dims->out_planes, 1, {MEM});")
-        write_expr = f"TensorWrite<{out_t}>::build(output)"
-    else:
-        out_decl = (f"Ptr2D<{out_t}> output(({out_t}*)d_out, (uint)dims->out_w, "
-                    f"(uint)dims->out_h, (uint)(dims->out_w * sizeof({out_t})), "
-                    f"{MEM});")
-        write_expr = f"PerThreadWrite<ND::_2D, {out_t}>::build(output)"
-
-    if fuse_with_read is not None:
-        # Per Oscar: the BorderReader takes the Image/Ptr2D read IOp as its
-        # backIOp: BorderReader<BT>::build(readIOp[, value]). The combined
-        # expression REPLACES the read at the head of the chain.
-        op_f, st_f, pb_f = fuse_with_read
+    if needs_read is not None:
+        # CONSTANT BorderReader: FKL's incomplete-const builder doesn't
+        # compile, so it needs the COMPLETE form build(readIOp, value). The
+        # combined expression REPLACES the read at the head of the chain.
+        # (All other border modes fuse via C++ fuse_back — no splice.)
+        op_f, st_f, pb_f = needs_read
         read_expr = op_f.cpp_with_read(st_f, pb_f, read_expr)
         iop_exprs = [e for e in iop_exprs if e is not None]
 
