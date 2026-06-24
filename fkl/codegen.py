@@ -21,7 +21,7 @@ from .operations import Op, ChainState, READ, WRITE
 from .types import DType
 
 # bump when generate_cu's emitted C++ changes for the SAME signature inputs
-CODEGEN_VERSION = 7
+CODEGEN_VERSION = 8
 
 
 def plan(ops: List[Op], in_dtype: DType, in_shape: Tuple[int, int, int],
@@ -79,7 +79,7 @@ def generate_cu(ops: List[Op], in_dtype: DType,
     # a closed if/elif ladder here.
     iop_exprs = []
     batch_fuse_head = False  # batch ReadBack ops need explicit fuse() w/ read
-    fuse_with_read = None    # op that consumes the read expr (BorderReader)
+    needs_read = None        # op requiring the read spliced in (CONSTANT border)
     pbase = 0
     pbase_by_op = []
     for op, st in zip(ops, states):
@@ -87,10 +87,10 @@ def generate_cu(ops: List[Op], in_dtype: DType,
             op.bind(st.dtype)
         pbase_by_op.append(pbase)
         if op.role not in (READ, WRITE):
-            if getattr(op, "_fuse_with_read", False):
-                if fuse_with_read is not None:
-                    raise ValueError("only one read-fusing op per chain")
-                fuse_with_read = (op, st, pbase)
+            if getattr(op, "_needs_read", False):
+                if needs_read is not None:
+                    raise ValueError("only one read-splicing op per chain")
+                needs_read = (op, st, pbase)
                 iop_exprs.append(None)  # placeholder, filled below
             else:
                 iop_exprs.append(op.cpp(st, pbase))
@@ -107,11 +107,12 @@ def generate_cu(ops: List[Op], in_dtype: DType,
     in_decl, read_expr = read_op.emit_read(in_st, MEM, n_inputs)
     out_decl, write_expr = write_op.emit_write(out_st, MEM, pbase_by_op[-1])
 
-    if fuse_with_read is not None:
-        # Per Oscar: the BorderReader takes the Image/Ptr2D read IOp as its
-        # backIOp: BorderReader<BT>::build(readIOp[, value]). The combined
-        # expression REPLACES the read at the head of the chain.
-        op_f, st_f, pb_f = fuse_with_read
+    if needs_read is not None:
+        # CONSTANT BorderReader: FKL's incomplete-const builder doesn't
+        # compile, so it needs the COMPLETE form build(readIOp, value). The
+        # combined expression REPLACES the read at the head of the chain.
+        # (All other border modes fuse via C++ fuse_back — no splice.)
+        op_f, st_f, pb_f = needs_read
         read_expr = op_f.cpp_with_read(st_f, pb_f, read_expr)
         iop_exprs = [e for e in iop_exprs if e is not None]
 

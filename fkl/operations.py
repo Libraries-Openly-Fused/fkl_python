@@ -740,12 +740,28 @@ _BORDER_TYPES = ("constant", "replicate", "reflect", "wrap", "reflect101")
 
 
 class BorderReader(Op):
-    """Out-of-bounds policy fused onto the read (BVF). Per Oscar: the input
-    is an Image/Ptr2D read, and BorderReader takes that complete Read IOp as
-    its backIOp directly: BorderReader<BT>::build(readIOp[, defaultValue]).
-    Codegen consumes the read expression (marker: _fuse_with_read)."""
+    """Out-of-bounds policy, fused backwards onto the read (BVF).
+
+    Value-less modes (replicate/reflect/wrap/reflect101) are emitted as a
+    plain IncompleteReadBack IOp:
+        BorderReader<BT>::build()
+    FKL's BackFuser::fuse_back (called inside executeOperations) detects the
+    IncompleteReadBackType and fuses it with the preceding Read IOp via
+    fk::fuse -> BorderReader::build(readIOp, selfIOp). Python no longer
+    splices the read in for these — that duplicated the C++ fusion. (Oscar
+    review, point 2.)
+
+    CONSTANT is the exception: FKL's incomplete builder
+    BorderReader<CONSTANT>::build(value) does not compile (border_reader.h
+    passes NullType where a backIOp is required), so the library only
+    supports the COMPLETE form build(readIOp, value). For that one mode we
+    still hand the read expression in (marker: _needs_read). All other modes
+    take the clean fuse_back path.
+    """
     name = "BorderReader"
-    _fuse_with_read = True
+
+    _BT = {"constant": "CONSTANT", "replicate": "REPLICATE",
+           "reflect": "REFLECT", "wrap": "WRAP", "reflect101": "REFLECT_101"}
 
     def __init__(self, border: str = "replicate", value=0.0):
         b = border.lower()
@@ -753,6 +769,9 @@ class BorderReader(Op):
             raise ValueError(f"border must be one of {_BORDER_TYPES}")
         self._b = b
         self._value = value
+        # only CONSTANT needs the read spliced in (FKL incomplete-const is
+        # unsupported); other modes fuse via C++ fuse_back.
+        self._needs_read = (b == "constant")
 
     @property
     def values(self):
@@ -764,18 +783,18 @@ class BorderReader(Op):
         if self._b == "constant":
             self._vals = pack_value(dt, self._value)
 
-    def cpp_with_read(self, state, pbase, read_expr: str) -> str:
-        bt = {"constant": "CONSTANT", "replicate": "REPLICATE",
-              "reflect": "REFLECT", "wrap": "WRAP",
-              "reflect101": "REFLECT_101"}[self._b]
-        if self._b == "constant":
-            self.bind(state.dtype)
-            return (f"BorderReader<BorderType::{bt}>::build("
-                    f"{read_expr}, {make_expr(state.dtype, pbase)})")
-        return f"BorderReader<BorderType::{bt}>::build({read_expr})"
-
     def cpp(self, state, pbase):
-        raise RuntimeError("BorderReader must be emitted via cpp_with_read")
+        # value-less borders: incomplete IOp, C++ fuse_back supplies the read.
+        if self._b != "constant":
+            return f"BorderReader<BorderType::{self._BT[self._b]}>::build()"
+        raise RuntimeError("CONSTANT BorderReader must be emitted via "
+                           "cpp_with_read (FKL incomplete-const unsupported)")
+
+    def cpp_with_read(self, state, pbase, read_expr: str) -> str:
+        # complete form: BorderReader<CONSTANT>::build(readIOp, value)
+        self.bind(state.dtype)
+        return (f"BorderReader<BorderType::CONSTANT>::build("
+                f"{read_expr}, {make_expr(state.dtype, pbase)})")
 
     def token(self, state):
         return f"BorderReader<{self._b},{state.dtype}>"
