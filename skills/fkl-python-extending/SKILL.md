@@ -8,8 +8,20 @@ description: Add a new FKL operation to the fkl-python front-end (operations.py 
 ## Architecture recap
 
 - `fkl/operations.py` - one Python descriptor class per C++ Operation.
+  - COMPUTE ops implement `cpp(state, pbase)` (the build() expression).
+  - Read ops (subclass `_ReadOp`) implement `emit_read(state, mem, n_inputs)`
+    -> `(in_decl, read_expr)`: they construct their OWN host-side input
+    buffer object (Ptr2D / Tensor / std::array<Ptr2D,B> / ...) AND the
+    build() that consumes it. A Read IOp is self-contained.
+  - Write ops (subclass `_WriteOp`) implement `emit_write(state, mem, pbase)`
+    -> `(out_decl, write_expr)`, the write counterpart.
 - `fkl/codegen.py`    - threads ChainState (dtype+shape) through the chain
                         and emits ONE host+device .cu with extern "C" fkl_entry.
+                        generate_cu() just calls read_op.emit_read() /
+                        write_op.emit_write() — there is NO if/elif ladder on
+                        op .name. Add a new IO layout by adding a Read/Write
+                        descriptor with emit_read/emit_write, not by editing
+                        codegen.
 - `fkl/backend.py`    - clang/nvcc single-step compile + disk cache.
 - `fkl/jit.py`        - compose() + FusedKernel hot path (ctypes).
 
@@ -86,6 +98,16 @@ def t_myop():
    whose InstanceType is ReadType -> BackFuser does NOT auto-fuse them with
    the previous read. Codegen wraps them as `fuse(read_expr, batch_expr)`.
    This is keyed off the op having a truthy `_batch` attribute.
+2b. ReadBack ops fuse for free via C++. executeOperations() internally calls
+   BackFuser::fuse_back(iOps...) (executors.h), and a value-less
+   IncompleteReadBack op (e.g. BorderReader<REPLICATE>::build()) placed as a
+   plain IOp in the flat list gets fused with the preceding Read automatically
+   — do NOT splice the read in from Python. EXCEPTION: BorderReader<CONSTANT>
+   is broken upstream — the incomplete builder build(value) does not compile
+   (border_reader.h:72 passes NullType where a backIOp is required), so it
+   needs the COMPLETE form build(readIOp, value). That one mode uses the
+   `_needs_read` marker so codegen splices the read expression in; every other
+   border mode takes the clean fuse_back path.
 3. FKL's LTS-C++17 branch is the supported base (it carries the fix for
    issue #244, ColorConversion FusedOperation aliases). On stale `main`
    the BGR2GRAY-family aliases fail to compile (see #244/#248).
@@ -102,7 +124,14 @@ def t_myop():
    over a const tuple -> rvalue-ref binding error (upstream bug). The
    divergent codegen launches launchDivergentBatchTransformDPP_Kernel
    directly with buildOperationSequence(...) lvalues and a generated
-   PySequenceSelector (1-based at(z), FKL convention).
+   PySequenceSelector. The selector is 0-BASED: exec() calls
+   divergent_operate<0>(z, seqs...) and runs the sequence at the 0-based
+   position equal to at(z) (data_parallel_patterns.h; upstream regression
+   test MySelector::at returns index==0?0u:1u). compose_divergent takes a
+   1-based plane_map at the API for readability, so _selector_cpp emits
+   (s-1). Do NOT confuse this with circular_tensor.h's SequenceSelectorType
+   (a different contract). Bump the `sv=` token in the divergent signature
+   when the emitted selector C++ changes, or stale .so files get reused.
 8. IOpSequences passed to the divergent kernel must be LVALUES (const auto
    seqN = buildOperationSequence(...)), not temporaries inlined in the
    launch expression.

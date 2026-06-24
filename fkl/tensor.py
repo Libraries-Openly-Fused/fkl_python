@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import ctypes
 
-from .types import DType, from_cai, _BASES
+from .types import DType, from_cai, from_shape, _BASES
 
 
 @dataclass
@@ -23,6 +23,22 @@ class DeviceView:
 
 
 def as_device_view(x) -> "DeviceView":
+    # FAST PATH: torch.Tensor. Avoids __cuda_array_interface__, which
+    # builds a fresh dict per access (~2.5us each — dominated the per-call
+    # overhead of fkl.flash_attention; measured 28us -> ~7us with this).
+    tt = _torch_tensor_type()
+    if tt is not None and type(x) is tt:
+        if not x.is_cuda:
+            raise TypeError("torch tensor must be on CUDA")
+        if not x.is_contiguous():
+            raise ValueError("non-contiguous arrays not supported; call .contiguous() first")
+        base = _TORCH_DTYPE_TO_BASE.get(x.dtype)
+        if base is None:
+            raise TypeError(f"unsupported torch dtype {x.dtype}")
+        dt, w, h, p = from_shape(tuple(x.shape), base)
+        dev = x.device.index
+        return DeviceView(x.data_ptr(), w, h, p, dt, x, 0 if dev is None else dev)
+
     cai = getattr(x, "__cuda_array_interface__", None)
     if cai is None:
         raise TypeError(
@@ -33,6 +49,29 @@ def as_device_view(x) -> "DeviceView":
         raise ValueError("non-contiguous arrays not supported; call .contiguous() first")
     dt, w, h, p = from_cai(cai["shape"], cai["typestr"])
     return DeviceView(int(cai["data"][0]), w, h, p, dt, x, _device_of(x))
+
+
+_torch_tensor_cls = False  # False = not probed yet; None = torch absent
+_TORCH_DTYPE_TO_BASE = {}
+
+
+def _torch_tensor_type():
+    global _torch_tensor_cls
+    if _torch_tensor_cls is False:
+        import sys
+        torch = sys.modules.get("torch")  # never import torch ourselves
+        if torch is None:
+            _torch_tensor_cls = None
+        else:
+            _torch_tensor_cls = torch.Tensor
+            _TORCH_DTYPE_TO_BASE.update({
+                torch.float32: "float32", torch.float16: "float16",
+                torch.bfloat16: "bfloat16", torch.uint8: "uint8",
+                torch.int8: "int8", torch.int16: "int16",
+                torch.int32: "int32", torch.int64: "int64",
+                torch.float64: "float64",
+            })
+    return _torch_tensor_cls
 
 
 def _device_of(x) -> int:
