@@ -269,12 +269,15 @@ class DivergentKernel:
         self._variants = {}
 
     def _selector_cpp(self):
-        # FKL convention (see SequenceSelectorType in circular_tensor.h):
-        # at(z) is uint, 1-based sequence index. Generate a chain of ternaries.
-        terms = []
-        for z, s in enumerate(self.plane_map):
-            terms.append((z, s))
-        expr = f"{self.plane_map[-1]}u"
+        # DivergentBatchTransformDPP is 0-BASED: exec() calls
+        # divergent_operate<0>(z, seqs...) and runs the sequence whose
+        # 0-based position matches at(z) (see data_parallel_patterns.h; the
+        # upstream regression test uses at(index)=index==0?0u:1u, i.e. 0 picks
+        # the FIRST sequence). plane_map is given 1-based at the API for
+        # readability, so emit (s-1) here. (NOTE: this is a DIFFERENT selector
+        # contract than circular_tensor.h's SequenceSelectorType.)
+        terms = [(z, s - 1) for z, s in enumerate(self.plane_map)]
+        expr = f"{terms[-1][1]}u"
         for z, s in reversed(terms[:-1]):
             expr = f"(index == {z}u ? {s}u : {expr})"
         return (
@@ -384,7 +387,9 @@ void fkl_entry(void* d_in, void* d_out, const FklDims* dims,
             "|".join(op.token(st) for op, st in
                      zip(ch, _plan(ch, dt, shape, B)[0]))
             for ch in self.chains)
-        sig = (f"divergent;arch={_ARCH};in={dt}x{B};map={tuple(self.plane_map)};"
+        # sv (selector version): bump when _selector_cpp's emitted C++ changes
+        # for the same plane_map, so stale .so files are not reused.
+        sig = (f"divergent;arch={_ARCH};sv=2;in={dt}x{B};map={tuple(self.plane_map)};"
                f"chains={chain_toks}")
         so = get_backend().compile(src, sig)
         lib = ctypes.CDLL(str(so))

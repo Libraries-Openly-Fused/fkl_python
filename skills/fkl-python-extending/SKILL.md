@@ -124,7 +124,14 @@ def t_myop():
    over a const tuple -> rvalue-ref binding error (upstream bug). The
    divergent codegen launches launchDivergentBatchTransformDPP_Kernel
    directly with buildOperationSequence(...) lvalues and a generated
-   PySequenceSelector (1-based at(z), FKL convention).
+   PySequenceSelector. The selector is 0-BASED: exec() calls
+   divergent_operate<0>(z, seqs...) and runs the sequence at the 0-based
+   position equal to at(z) (data_parallel_patterns.h; upstream regression
+   test MySelector::at returns index==0?0u:1u). compose_divergent takes a
+   1-based plane_map at the API for readability, so _selector_cpp emits
+   (s-1). Do NOT confuse this with circular_tensor.h's SequenceSelectorType
+   (a different contract). Bump the `sv=` token in the divergent signature
+   when the emitted selector C++ changes, or stale .so files get reused.
 8. IOpSequences passed to the divergent kernel must be LVALUES (const auto
    seqN = buildOperationSequence(...)), not temporaries inlined in the
    launch expression.
