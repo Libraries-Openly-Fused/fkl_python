@@ -34,6 +34,7 @@ disk cache in `~/.cache/fkl/` and start instantly.
 | `09_video_temporal_window.py` | CircularTensor: rolling N-frame window for temporal models, one fused update per frame |
 | `10_torch_realworld.py` | torch-specific recipe (needs torch+cuda installed) |
 | `11_yolo_inference.py` | **REAL end-to-end**: JPEG -> ONE fused GPU kernel (letterbox+normalize+CHW) -> YOLOv8n ONNX -> NMS -> boxes. Run `./fetch_yolo_assets.sh` first; needs `pip install numpy pillow onnxruntime` |
+| `12_bound_pipeline.py` | compose-time buffer binding: `TensorRead(x)`/`TensorWrite(out)` -> eager compile, argument-free `k()`, call-time overrides, `DeviceBuffer.from_ptr` raw pointers |
 
 ## The one-page mental model
 
@@ -48,3 +49,5 @@ out  = pipe(x2)           # later calls: single ctypes call, ~70 us
   recompile.
 - Lists = Horizontal Fusion: `Crop([r1, r2, ...])` or `pipe([img1, img2])`.
 - `compose_divergent(plane_map, chain1, chain2)` = Divergent HF.
+- BINDING: `compose(fkl.TensorRead(x), ..., fkl.TensorWrite(out))` compiles
+  eagerly and runs as `k()` — buffers are call defaults, args override.

@@ -52,6 +52,34 @@ out = pipe(x, stream=torch.cuda.current_stream())  # async on torch stream
 With an external stream the call does NOT sync (caller owns the stream).
 Without one, an internal static stream is used and synced before return.
 
+## Compose-time buffer binding (argument-free kernels)
+
+Read/write ops optionally take a concrete buffer at construction. A chain
+with a bound read compiles EAGERLY inside compose() (dtype/shape are known
+then) and runs with no arguments:
+
+```python
+k = fkl.compose(fkl.TensorRead(x), fkl.Mul(2.0), fkl.TensorWrite(out))
+k()                    # reads x, writes out — ready before the first call
+k(stream=s)            # argless + async on a caller-owned stream
+k(y); k(y, out=z)      # overrides: validated against the compiled signature
+```
+
+Rules:
+- Binding is by POINTER: refill x in place and just call k() again.
+- Bound buffers are call defaults. Overrides with a different dtype/shape
+  raise ValueError (a bound kernel is compiled for ONE signature; compose
+  an unbound chain for multi-signature use).
+- Read-only binding auto-allocates the output per call; write-only binding
+  keeps lazy pipe(x) with the bound buffer as default out=.
+- GPU-only (target="cpu" rejects bindings); lists (batch HF) cannot be
+  bound — pass them at call time.
+- TensorSplit/SplitWrite/TensorTSplit take dest the same way;
+  TensorPack(ch, source) binds a planar input.
+- Raw device pointers: `fkl.DeviceBuffer.from_ptr(ptr, shape, dtype)` is a
+  NON-OWNING zero-copy wrap (caller keeps ownership/lifetime; shape folds a
+  trailing 2..4 dim into a vector pixel type, or pass 'uint8x3' + (H, W)).
+
 ## Operation catalog
 
 Memory:    TensorRead(), TensorWrite(), TensorSplit() [packed->planar],

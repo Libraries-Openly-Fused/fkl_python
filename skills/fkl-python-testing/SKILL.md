@@ -18,6 +18,7 @@ python3 test_horizontal_fusion.py          # HF: batch crops -> planes
 python3 test_operations.py                 # every op vs CPU reference
 python3 test_matrix.py                     # legacy broad matrix
 python3 test_e2e.py                        # timing + cache behaviour
+python3 test_bound_compose.py              # compose-time binding + from_ptr
 ```
 
 Each suite exits 0/1 and prints [PASS]/[FAIL] per case. First run compiles

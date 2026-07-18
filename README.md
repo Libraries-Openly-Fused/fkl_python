@@ -56,6 +56,44 @@ out = pipe(x, stream=torch.cuda.current_stream())   # zero-copy, async
 
 No torch? Use the built-in dependency-free `DeviceBuffer` (CUDA driver via ctypes).
 
+## Compose-time buffer binding (argument-free kernels)
+
+The read/write ops optionally take a concrete buffer (cuda torch tensor, any
+`__cuda_array_interface__` object, or `DeviceBuffer`) at construction. A
+chain whose read is bound knows its dtype/shape immediately, so `compose()`
+compiles **eagerly** — the kernel is ready-to-run before the first call:
+
+```python
+x   = torch.empty(1080, 1920, 3, device="cuda", dtype=torch.uint8)
+out = torch.empty(3, 1080, 1920, device="cuda")
+
+k = fkl.compose(
+    fkl.TensorRead(x),          # input bound -> eager compile here
+    fkl.Cast("float32"),
+    fkl.Div((255.0,) * 3),
+    fkl.TensorSplit(out),       # output bound
+)
+for frame in camera:
+    x.copy_(frame)              # refill the bound buffer in place
+    k()                         # no arguments; k(stream=s) for async
+```
+
+Bound buffers are call **defaults**: `k(y)` / `k(y, out=z)` override them and
+are validated against the compiled signature (a different dtype/shape raises
+— compose an unbound chain for that). Binding only the read auto-allocates
+the output per call; binding only the write keeps the usual lazy `pipe(x)`
+path with the bound buffer as default `out=`. Unbound chains behave exactly
+as before.
+
+Raw pointers from C-style integrations bind the same way via a non-owning
+wrapper (the caller keeps ownership of the allocation — the wrapper never
+frees it):
+
+```python
+buf = fkl.DeviceBuffer.from_ptr(ptr, (1080, 1920, 3), "uint8")  # zero-copy
+k = fkl.compose(fkl.TensorRead(buf), ..., fkl.TensorWrite(dst))
+```
+
 ## Setup
 
 ### Plug and play (wheel with vendored headers)
@@ -105,11 +143,15 @@ backends (clang with auto-shims, nvcc):
 | test_circular_tensor             | 21    | PASS  | PASS |
 | test_thread_fusion               | 5     | PASS  | PASS |
 | test_e2e (timing/cache)          | 1     | PASS  | PASS |
+| test_bound_compose (binding)     | 41    | PASS  | PASS |
 
-Plus, separately: test_torch_integration (9 checks, real torch 2.12+cu130:
-zero-copy both ways, external streams, CircularTensor->torch) and
-test_cpu_backend (5 checks, ParArch::CPU with numpy in/out, CPU==GPU
-cross-validated).
+(test_bound_compose verified on NVIDIA GB10, sm_121, CUDA 13.0, both
+backends.)
+
+Plus, separately: test_torch_integration (9 checks verified on real torch
+2.12+cu130: zero-copy both ways, external streams, CircularTensor->torch;
++5 bound-compose checks pending a torch-enabled run) and test_cpu_backend
+(5 checks, ParArch::CPU with numpy in/out, CPU==GPU cross-validated).
 
 ## CPU backend (no CUDA required)
 
@@ -153,8 +195,9 @@ true multi-GPU runs still need a 2+ GPU machine.
   [#250](https://github.com/Libraries-Openly-Fused/FusedKernelLibrary/issues/250)
   (grid.z = sum of sequence z-extents).
 
-128 checks per backend (+ 9 torch + 5 cpu separately). Steady-state hot launch ~70 µs/call; cache-hit
-compose ~0 ms (lazy); cold compile ~1-3 s once per chain signature.
+163 checks per backend (+ 14 torch + 5 cpu separately). Steady-state hot launch ~70 µs/call; cache-hit
+compose ~0 ms (lazy; bound compose eagerly compiles — cache-hit ~1 ms);
+cold compile ~1-3 s once per chain signature.
 
 ## Temporal video: CircularTensor
 
@@ -205,11 +248,12 @@ testing the package.
 
 ## Examples
 
-`examples/` — 8 runnable, dependency-free scripts (see `examples/README.md`):
-vertical fusion basics, single-kernel DNN preprocessing, multi-ROI batch
-(HF), multi-camera + Divergent HF, color pipelines, warping + border
-policies, torch/DLPack interop, and a fused-vs-unfused benchmark
-(~5x at 1080p for a 6-op chain).
+`examples/` — runnable, mostly dependency-free scripts (see
+`examples/README.md`): vertical fusion basics, single-kernel DNN
+preprocessing, multi-ROI batch (HF), multi-camera + Divergent HF, color
+pipelines, warping + border policies, torch/DLPack interop, a
+fused-vs-unfused benchmark (~5x at 1080p for a 6-op chain), and
+compose-time bound pipelines (argument-free `k()`).
 
 ## Current scope / next steps
 

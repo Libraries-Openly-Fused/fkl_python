@@ -15,6 +15,15 @@ Because op TYPES (not values) define the kernel, the first call with a given
 (chain, input dtype/layout) compiles once; every other call -- with any crop
 rect, any mul factor, any size values that keep the same types -- reuses the
 cached .so. Values travel through params[].
+
+COMPOSE-TIME BINDING: TensorRead(x) / TensorWrite(out) accept concrete
+buffers. A chain with a bound read compiles EAGERLY inside compose() (the
+dtype/shape are known then) and runs argument-free:
+
+    k = fkl.compose(fkl.TensorRead(x), fkl.Mul(2.0), fkl.TensorWrite(out))
+    k()             # ready-to-run: no arguments, writes into `out`
+    k(stream=s)     # same, async on an external stream
+    k(y)            # override the binding (same dtype/shape enforced)
 """
 from __future__ import annotations
 import ctypes
@@ -38,6 +47,14 @@ class FusedKernel:
     """A composed chain. Compiles lazily on first call (input dtype/layout
     is only known then) and caches per signature.
 
+    COMPOSE-TIME BINDING: if the chain's read/write ops carry bound buffers
+    (fkl.TensorRead(x) / fkl.TensorWrite(out)), the input dtype/shape are
+    known immediately, so the kernel compiles EAGERLY here and can be called
+    with no arguments — k() / k(stream=s). Bound buffers are call defaults:
+    k(y) / k(y, out=z) override them, validated against the compiled
+    signature. Binding a read without a write auto-allocates the output per
+    call, exactly like pipe(x) does today.
+
     target="gpu" (default) JITs a CUDA .so; target="cpu" JITs a plain C++
     .so running FKL's ParArch::CPU executor on host memory (numpy in/out,
     no CUDA required)."""
@@ -54,6 +71,28 @@ class FusedKernel:
         self.target = target
         self.thread_fusion = bool(thread_fusion) and target == "gpu"
         self._variants = {}  # signature -> (entry fn, params buffer, out_state)
+        # ---- compose-time buffer binding (optional) -----------------------
+        self._bound_in = getattr(ops[0], "_bound", None)
+        self._bound_out = getattr(ops[-1], "_bound", None)
+        self._bound_st = None  # (in DType, (w, h, planes)) once eagerly compiled
+        self._is_bound = self._bound_in is not None or self._bound_out is not None
+        if self._is_bound and target != "gpu":
+            raise ValueError("compose-time buffer binding requires "
+                             "target='gpu' (CPU chains take numpy arrays "
+                             "per call)")
+        if self._bound_in is not None:
+            if isinstance(self._bound_in, (list, tuple)):
+                raise TypeError("cannot bind a batch (list of images) at "
+                                "compose time; pass the list at call time")
+            vin: DeviceView = as_device_view(self._bound_in)
+            in_shape = (vin.width, vin.height, vin.planes)
+            # EAGER compile: dtype/shape are known now, so the kernel is
+            # ready-to-run before the first call (disk-cache hit if this
+            # signature was ever compiled before).
+            _, _, out_st, _ = self._get_variant(vin.dtype, in_shape)
+            self._bound_st = (vin.dtype, in_shape)
+            if self._bound_out is not None:
+                self._check_out(as_device_view(self._bound_out), out_st)
 
     # ---- compile path (cold, once per signature) --------------------------
     def _tf_effective(self, dt: DType, shape) -> bool:
@@ -93,13 +132,57 @@ class FusedKernel:
         self._variants[sig] = variant
         return variant
 
+    # ---- bound-buffer validation (VALUE-level, like params[]) -------------
+    @staticmethod
+    def _check_out(vout: DeviceView, out_st):
+        """Validate an output buffer against the compiled output state.
+        Layouts may legitimately differ from out_st's (w, h, planes) view of
+        the same bytes (e.g. TensorSplit destinations are (C*planes, H, W)),
+        so check what the kernel actually assumes about the destination
+        pointer: base dtype + total byte size."""
+        need = (out_st.width * out_st.height * out_st.planes
+                * out_st.dtype.itemsize)
+        got = vout.width * vout.height * vout.planes * vout.dtype.itemsize
+        if vout.dtype.base != out_st.dtype.base or got != need:
+            raise ValueError(
+                f"output buffer mismatch: kernel writes {need} bytes of "
+                f"{out_st.dtype.base} (w={out_st.width}, h={out_st.height}, "
+                f"planes={out_st.planes}, channels={out_st.dtype.channels}); "
+                f"buffer has {got} bytes of {vout.dtype.base}")
+
+    def _check_in(self, vin: DeviceView):
+        """A bound kernel was compiled eagerly for ONE input signature; an
+        explicit-argument override must match it (a different dtype/shape is
+        a different kernel — compose an unbound chain for that)."""
+        b_dt, b_shape = self._bound_st
+        if vin.dtype != b_dt or (vin.width, vin.height, vin.planes) != b_shape:
+            raise ValueError(
+                f"input override mismatch: kernel was compiled at compose "
+                f"time for {b_dt} (w={b_shape[0]}, h={b_shape[1]}, "
+                f"planes={b_shape[2]}); got {vin.dtype} (w={vin.width}, "
+                f"h={vin.height}, planes={vin.planes})")
+
     # ---- HOT PATH ----------------------------------------------------------
-    def __call__(self, x, out=None, stream=None):
+    def __call__(self, x=None, out=None, stream=None):
+        if x is None:
+            if self._bound_in is None:
+                raise TypeError(
+                    "this kernel has no bound input buffer; call pipe(x) or "
+                    "bind one at compose time with fkl.TensorRead(x)")
+            x = self._bound_in
+        if out is None:
+            out = self._bound_out  # stays None when unbound: auto-alloc below
         if self.target == "cpu":
             return self._call_cpu(x, out)
         if isinstance(x, (list, tuple)):
+            if self._bound_st is not None:
+                raise ValueError(
+                    "kernel was compiled at compose time for a single bound "
+                    "input; a batch (list) call needs an unbound compose()")
             return self._call_batch(x, out, stream)
         vin: DeviceView = as_device_view(x)
+        if self._bound_st is not None:
+            self._check_in(vin)
         if vin.device != 0:
             # make the input's device current for the launch + output alloc
             from .tensor import DeviceBuffer
@@ -110,7 +193,11 @@ class FusedKernel:
 
         if out is None:
             out = self._alloc_out(vin, out_st)
-        vout: DeviceView = as_device_view(out)
+            vout: DeviceView = as_device_view(out)
+        else:
+            vout: DeviceView = as_device_view(out)
+            if self._is_bound:
+                self._check_out(vout, out_st)
 
         dims = _FklDims(vin.width, vin.height, vin.planes,
                         out_st.width, out_st.height, out_st.planes)
@@ -139,7 +226,11 @@ class FusedKernel:
 
         if out is None:
             out = self._alloc_out(v0, out_st)
-        vout: DeviceView = as_device_view(out)
+            vout: DeviceView = as_device_view(out)
+        else:
+            vout: DeviceView = as_device_view(out)
+            if self._is_bound:
+                self._check_out(vout, out_st)
 
         # device-pointer array (host-side; FKL copies Ptr2D params by value
         # into kernel arguments at launch)
@@ -226,7 +317,15 @@ class FusedKernel:
 
 def compose(*ops: Op, target: str = "gpu",
             thread_fusion: bool = False) -> FusedKernel:
-    """thread_fusion=True opts into FKL's ThreadFusion (TF::ENABLED):
+    """Build a FusedKernel from an op chain (TensorRead ... TensorWrite).
+
+    Unbound (default): lazy — the first call with a concrete input compiles
+    the kernel for that signature. Bound: pass concrete buffers to the read/
+    write ops (fkl.TensorRead(x), fkl.TensorWrite(out)) and the kernel
+    compiles EAGERLY here, ready to be called with no arguments (see
+    FusedKernel).
+
+    thread_fusion=True opts into FKL's ThreadFusion (TF::ENABLED):
     each thread processes multiple elements with vectorized accesses.
     DEFAULT IS FALSE, matching FKL's own TransformDPP<> default
     (TF::DISABLED): per upstream guidance it only pays off in a small set
@@ -264,6 +363,11 @@ class DivergentKernel:
         for ch in chains:
             if ch[0].role != READ or ch[-1].role != WRITE:
                 raise ValueError("every chain needs TensorRead() ... TensorWrite()")
+            if (getattr(ch[0], "_bound", None) is not None
+                    or getattr(ch[-1], "_bound", None) is not None):
+                raise ValueError(
+                    "compose_divergent does not support compose-time buffer "
+                    "binding; pass the batch (and out=) at call time")
         self.plane_map = list(plane_map)
         self.chains = [list(c) for c in chains]
         self._variants = {}

@@ -374,8 +374,13 @@ class _ReadOp(Op):
     if/elif ladder in codegen) means a Read IOp is self-contained — exactly
     how the C++ side carries the read in its IOp type. emit_read is the read
     counterpart to cpp() for COMPUTE ops.
+
+    `_bound` optionally holds a concrete device buffer bound at construction
+    (compose-time binding). Like params[], it is a VALUE-level concern: it
+    never appears in token()/codegen, only in which pointer the launch uses.
     """
     role = READ
+    _bound = None  # optional compose-time-bound input buffer
 
     def emit_read(self, state, mem, n_inputs):
         """-> (in_decl, read_expr). in_decl declares the host buffer object
@@ -385,8 +390,9 @@ class _ReadOp(Op):
 
 class _WriteOp(Op):
     """A chain-tail memory Write IOp. emit_write() is the write counterpart
-    to _ReadOp.emit_read()."""
+    to _ReadOp.emit_read(). `_bound` mirrors _ReadOp._bound for outputs."""
     role = WRITE
+    _bound = None  # optional compose-time-bound output buffer
 
     def emit_write(self, state, mem, pbase):
         """-> (out_decl, write_expr). out_decl declares the host output
@@ -397,8 +403,17 @@ class _WriteOp(Op):
 class TensorRead(_ReadOp):
     """Read input. 2D Ptr2D -> PerThreadRead<_2D>; 3D Tensor -> TensorRead;
     batch of B same-size 2D images -> std::array<Ptr2D,B> -> PerThreadRead
-    (BatchRead under the hood, the HF read)."""
+    (BatchRead under the hood, the HF read).
+
+    TensorRead(x) BINDS a concrete buffer (cuda torch tensor, any
+    __cuda_array_interface__ object, or DeviceBuffer — incl. from_ptr) at
+    compose() time: the kernel takes dtype/shape from it, compiles eagerly,
+    and can then be called with no arguments. Passing an argument at call
+    time still overrides the binding (same dtype/shape required)."""
     name = "TensorRead"
+
+    def __init__(self, source=None):
+        self._bound = source
 
     def emit_read(self, state, mem, n_inputs):
         t = state.dtype.ctype
@@ -424,7 +439,13 @@ class TensorRead(_ReadOp):
 
 
 class TensorWrite(_WriteOp):
+    """Write output. TensorWrite(out) BINDS a concrete destination buffer at
+    compose() time (see TensorRead): the bound kernel writes there when no
+    out= is passed. out= at call time still overrides the binding."""
     name = "TensorWrite"
+
+    def __init__(self, dest=None):
+        self._bound = dest
 
     def emit_write(self, state, mem, pbase):
         t = state.dtype.ctype
@@ -443,8 +464,12 @@ class TensorWrite(_WriteOp):
 class TensorSplit(_WriteOp):
     """Write vector pixels as separate planes (planar layout for DNNs).
     uchar3 HxW -> 3 planes of HxW uchar. planes = batch (thread.z);
-    color_planes = channels (split offsets)."""
+    color_planes = channels (split offsets). TensorSplit(out) binds a
+    concrete destination at compose() time (see TensorWrite)."""
     name = "TensorSplit"
+
+    def __init__(self, dest=None):
+        self._bound = dest
 
     def out_shape(self, shape):
         return shape  # planes encoded by channels at alloc time
@@ -596,8 +621,12 @@ class Warping(Op):
 
 class SplitWrite(_WriteOp):
     """Write a vector-pixel stream into per-channel 2D planes laid out
-    contiguously (like TensorSplit but via SplitWrite params)."""
+    contiguously (like TensorSplit but via SplitWrite params).
+    SplitWrite(out) binds a concrete destination (see TensorWrite)."""
     name = "SplitWrite"
+
+    def __init__(self, dest=None):
+        self._bound = dest
 
     def emit_write(self, state, mem, pbase):
         base_t = state.dtype.base_ctype
@@ -687,13 +716,15 @@ class ReadSet(_ReadOp):
 
 class TensorPack(_ReadOp):
     """Read PLANAR (CHW) data as packed vector pixels: the inverse of
-    TensorSplit. Input buffer must be planar with `channels` planes."""
+    TensorSplit. Input buffer must be planar with `channels` planes.
+    TensorPack(ch, source) binds a concrete input (see TensorRead)."""
     name = "TensorPack"
 
-    def __init__(self, channels: int):
+    def __init__(self, channels: int, source=None):
         if channels not in (2, 3, 4):
             raise ValueError("TensorPack needs 2..4 channels")
         self._ch = channels
+        self._bound = source
 
     def out_dtype(self, dt):
         return dt.with_channels(self._ch)
@@ -712,8 +743,12 @@ class TensorPack(_ReadOp):
 
 class TensorTSplit(_WriteOp):
     """Write to T3D transposed-planes layout (color_planes outermost):
-    layout [C][planes][H][W] instead of TensorSplit's [planes][C][H][W]."""
+    layout [C][planes][H][W] instead of TensorSplit's [planes][C][H][W].
+    TensorTSplit(out) binds a concrete destination (see TensorWrite)."""
     name = "TensorTSplit"
+
+    def __init__(self, dest=None):
+        self._bound = dest
 
     def emit_write(self, state, mem, pbase):
         base_t = state.dtype.base_ctype
