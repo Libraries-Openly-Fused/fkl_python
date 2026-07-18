@@ -96,8 +96,39 @@ def t_batch_hf_from_torch_list():
                and out[0].max().item() == 10.0 and out[2].max().item() == 30.0)
 
 
+def t_bound_compose_torch():
+    """Compose-time binding with torch tensors: eager compile, argless call,
+    argless call on an external torch stream."""
+    x = torch.full((8, 16), 3.0, device="cuda", dtype=torch.float32)
+    out = torch.empty_like(x)
+    k = fkl.compose(fkl.TensorRead(x), fkl.Mul(2.0), fkl.Add(1.0),
+                    fkl.TensorWrite(out))
+    check_true("bound compose: eager compile at compose()",
+               len(k._variants) == 1)
+    ret = k()                                        # no arguments at all
+    check_true("bound compose: torch argless call",
+               ret is out and torch.allclose(out, torch.full_like(out, 7.0)))
+    x.fill_(5.0)                                     # binding is by pointer
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        k(stream=s.cuda_stream)                      # argless + async
+    s.synchronize()
+    check_true("bound compose: argless on external torch stream",
+               torch.allclose(out, torch.full_like(out, 11.0)))
+    y = torch.full((8, 16), 1.0, device="cuda")
+    k(y)                                             # override the binding
+    check_true("bound compose: override writes bound out",
+               torch.allclose(out, torch.full_like(out, 3.0)))
+    try:
+        k(torch.full((4, 4), 1.0, device="cuda"))
+        check_true("bound compose: shape override mismatch raises", False)
+    except ValueError:
+        check_true("bound compose: shape override mismatch raises", True)
+
+
 if __name__ == "__main__":
     run([t_torch_in_dlpack_out, t_dlpack_zero_copy_roundtrip,
          t_torch_stream_async, t_out_preallocated_torch,
          t_uchar3_image_preproc_to_torch, t_circular_tensor_to_torch,
-         t_batch_hf_from_torch_list], "torch-integration")
+         t_batch_hf_from_torch_list, t_bound_compose_torch],
+        "torch-integration")

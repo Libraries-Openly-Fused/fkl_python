@@ -3,6 +3,10 @@
 Supports torch.Tensor(cuda), cupy.ndarray, numba, and the built-in
 DeviceBuffer via __cuda_array_interface__. Trailing dims of size 2..4 map to
 CUDA vector pixel types (uchar3, float4, ...) per fkl.types.from_cai.
+
+Raw device pointers (C-style integrations) enter through
+DeviceBuffer.from_ptr(ptr, shape, dtype): a NON-OWNING wrap that gives the
+pointer the full interop surface (CAI, DLPack, compose-time binding).
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -108,6 +112,7 @@ class DeviceBuffer:
     allocation happens with that device's primary context current)."""
     _cuda = None
     _ctxs = {}
+    _owns = True  # False for from_ptr views (never free external memory)
 
     def __init__(self, width: int, height: int = 1, dtype="float32",
                  channels: int = 1, planes: int = 1, device: int = 0):
@@ -127,6 +132,72 @@ class DeviceBuffer:
     def from_state(cls, st, device: int = 0):
         return cls(st.width, st.height, st.dtype.base,
                    channels=st.dtype.channels, planes=st.planes, device=device)
+
+    @classmethod
+    def from_ptr(cls, ptr: int, shape, dtype="float32", stream=None,
+                 device: int = 0) -> "DeviceBuffer":
+        """NON-OWNING wrap of an external raw device pointer.
+
+        For C-style integrations: hand a device pointer straight into the
+        fkl world (compose-time binding, kernel I/O, DLPack export) with no
+        copies and no ownership transfer.
+
+            buf = fkl.DeviceBuffer.from_ptr(ptr, (H, W, 3), "uint8")
+            k = fkl.compose(fkl.TensorRead(buf), ..., fkl.TensorWrite(dst))
+
+        ptr    : raw CUDA device pointer (int, non-null), C-contiguous data.
+        shape  : array dims with the library-wide folding rules of
+                 __cuda_array_interface__ — (W,), (H, W), (planes, H, W);
+                 a trailing dim of 2..4 folds into a vector pixel type.
+                 A vector dtype spec ('uint8x3') may be passed instead of
+                 the trailing dim — never together with it (that would
+                 double-count the channels; it raises TypeError).
+        stream : optional producer stream (int handle / torch / cupy
+                 stream). Recorded in __cuda_array_interface__ (v3) so
+                 stream-aware consumers synchronize with it; a handle of
+                 0 (the legacy default stream) is advertised as 1, the
+                 spelling CAI v3 requires. fkl kernels still take their
+                 launch stream per call.
+        device : CUDA device ordinal the pointer lives on.
+
+        LIFETIME: the wrapper never frees `ptr` (not on __del__, not via a
+        DLPack consumer's deleter). The CALLER owns the allocation and must
+        keep it alive for as long as the wrapper — or any kernel bound to
+        it — is in use."""
+        if ptr is None or int(ptr) == 0:
+            raise ValueError("from_ptr requires a non-null device pointer")
+        cls._load_driver()
+        from .types import dtype as _d, from_shape
+        dt0 = _d(dtype)  # accepts 'float32', 'uint8x3', ('uint8', 3), DType
+        if dt0.channels > 1:
+            dims = list(shape)
+            if len(dims) >= 2 and dims[-1] == dt0.channels:
+                # (H, W, 3) + 'uint8x3' would double-count the channels and
+                # silently size the wrapper channels x the real allocation
+                raise TypeError(
+                    f"ambiguous spec: trailing dim of shape {tuple(shape)} "
+                    f"matches the channels of vector dtype {dt0}; drop the "
+                    f"trailing dim or pass the base dtype {dt0.base!r}")
+            if len(dims) == 1:
+                w, h, p = dims[0], 1, 1
+            elif len(dims) == 2:
+                (h, w), p = dims, 1
+            elif len(dims) == 3:
+                p, h, w = dims
+            else:
+                raise TypeError(f"unsupported shape {tuple(shape)} for {dt0}")
+            dt = dt0
+        else:
+            dt, w, h, p = from_shape(tuple(shape), dt0.base)
+        self = cls.__new__(cls)
+        self.device = int(device)
+        self.dtype = dt
+        self.width, self.height, self.planes = int(w), int(h), int(p)
+        self._nbytes = self.width * self.height * self.planes * dt.itemsize
+        self._dptr = ctypes.c_void_p(int(ptr))
+        self._owns = False
+        self._stream = stream
+        return self
 
     @classmethod
     def _activate(cls, device: int):
@@ -190,8 +261,17 @@ class DeviceBuffer:
         dims.append(self.width)
         if self.dtype.channels > 1:
             dims.append(self.dtype.channels)
-        return {"shape": tuple(dims), "typestr": ts,
-                "data": (self.ptr, False), "version": 3}
+        cai = {"shape": tuple(dims), "typestr": ts,
+               "data": (self.ptr, False), "version": 3}
+        # producer stream recorded by from_ptr(stream=...) — CAI v3 allows
+        # advertising it so stream-aware consumers synchronize before use.
+        # The spec disallows the raw 0: the legacy default stream is spelled
+        # 1, so a caller's stream=0 keeps its synchronization contract.
+        s = getattr(self, "_stream", None)
+        if s is not None:
+            h = stream_handle(s)
+            cai["stream"] = h if h else 1
+        return cai
 
     # ---- DLPack export (zero-copy into torch/cupy/jax) ----------------------
     # torch.from_dlpack(buf) / cupy.from_dlpack(buf) reuse OUR device memory:
@@ -206,6 +286,8 @@ class DeviceBuffer:
     def __del__(self):
         try:
             if getattr(self, "_dptr", None) and self._dptr.value:
+                if not getattr(self, "_owns", True):
+                    return  # from_ptr view: the caller owns the memory
                 if getattr(self, "_exported_dlpack", False):
                     return  # ownership moved to the DLPack consumer
                 self._cuda.cuMemFree_v2(self._dptr)
@@ -289,7 +371,10 @@ def _make_dlpack_capsule(buf: "DeviceBuffer"):
         if entry is not None:
             b = entry[2]
             try:
-                if getattr(b, "_dptr", None) and b._dptr.value:
+                # from_ptr views never own the memory: the DLPack consumer
+                # gets a zero-copy view, the external owner keeps the bytes
+                if (getattr(b, "_owns", True)
+                        and getattr(b, "_dptr", None) and b._dptr.value):
                     b._cuda.cuMemFree_v2(b._dptr)
                     b._dptr = ctypes.c_void_p()
             except Exception:
