@@ -255,20 +255,38 @@ _DL_CODES = {
 _dlpack_keepalive = {}  # capsule id -> (managed, shape_arr, buffer)
 
 
-def _make_dlpack_capsule(buf: "DeviceBuffer"):
+def _make_dlpack_capsule(buf: "DeviceBuffer", dims=None):
+    """dims=None exports the buffer's natural shape. An explicit dims
+    reinterprets the SAME C-contiguous memory under another shape (used by
+    fkl.Tensor.reshape / pipeline outputs, e.g. planar (C, H, W) views over
+    a split write); it must cover exactly the buffer's base elements.
+
+    A buffer may be exported several times (e.g. two reshaped Tensor views
+    each handed to torch): exports are refcounted, and the device memory is
+    freed when the LAST consumer releases its capsule."""
     code_bits = _DL_CODES.get(buf.dtype.base)
     if code_bits is None:
         raise TypeError(f"DLPack: unsupported base dtype {buf.dtype.base}")
     code, bits = code_bits
 
-    dims = []
-    if buf.planes > 1:
-        dims.append(buf.planes)
-    if buf.height > 1 or buf.planes > 1:
-        dims.append(buf.height)
-    dims.append(buf.width)
-    if buf.dtype.channels > 1:
-        dims.append(buf.dtype.channels)
+    if dims is None:
+        dims = []
+        if buf.planes > 1:
+            dims.append(buf.planes)
+        if buf.height > 1 or buf.planes > 1:
+            dims.append(buf.height)
+        dims.append(buf.width)
+        if buf.dtype.channels > 1:
+            dims.append(buf.dtype.channels)
+    else:
+        dims = [int(d) for d in dims]
+        n = 1
+        for d in dims:
+            n *= d
+        n_base = buf._nbytes // _BASES[buf.dtype.base][2]
+        if n != n_base:
+            raise ValueError(
+                f"DLPack dims {tuple(dims)} cover {n} elements; buffer has {n_base}")
     ndim = len(dims)
     shape_arr = (ctypes.c_int64 * ndim)(*dims)
 
@@ -289,7 +307,10 @@ def _make_dlpack_capsule(buf: "DeviceBuffer"):
         if entry is not None:
             b = entry[2]
             try:
-                if getattr(b, "_dptr", None) and b._dptr.value:
+                # several capsules may share the buffer: last one frees
+                b._dlpack_exports -= 1
+                if (b._dlpack_exports == 0
+                        and getattr(b, "_dptr", None) and b._dptr.value):
                     b._cuda.cuMemFree_v2(b._dptr)
                     b._dptr = ctypes.c_void_p()
             except Exception:
@@ -298,6 +319,7 @@ def _make_dlpack_capsule(buf: "DeviceBuffer"):
     managed.deleter = _deleter
     # keep the struct + shape array + deleter + buffer alive until consumed
     _dlpack_keepalive[key] = (managed, shape_arr, buf, _deleter)
+    buf._dlpack_exports = getattr(buf, "_dlpack_exports", 0) + 1
     buf._exported_dlpack = True   # our __del__ must not double-free
 
     pycapsule_new = ctypes.pythonapi.PyCapsule_New

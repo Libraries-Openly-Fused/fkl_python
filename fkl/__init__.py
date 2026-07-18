@@ -27,6 +27,8 @@ from .flex import ScoreMod, ALiBi, SoftCap, SlidingWindow, BlockMask
 from .backend import CompilerBackend, set_backend, get_backend, clear_cache
 from .tensor import DeviceBuffer
 from .types import DType, dtype
+from .highlevel import Tensor, Image, ImageBatch, Pipeline, pipe
+from . import functional as F
 
 __all__ = [
     "TensorRead", "TensorWrite", "TensorSplit", "SplitWrite",
@@ -43,6 +45,7 @@ __all__ = [
     "ScoreMod", "ALiBi", "SoftCap", "SlidingWindow", "BlockMask",
     "CompilerBackend", "set_backend", "get_backend", "clear_cache",
     "DeviceBuffer", "DType", "dtype",
+    "Tensor", "Image", "ImageBatch", "Pipeline", "pipe", "F",
 ]
 
 __version__ = "0.6.0"

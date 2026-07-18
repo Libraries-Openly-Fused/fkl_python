@@ -52,6 +52,38 @@ out = pipe(x, stream=torch.cuda.current_stream())  # async on torch stream
 With an external stream the call does NOT sync (caller owns the stream).
 Without one, an internal static stream is used and synced before return.
 
+## PyTorch-style layer (Tensor / Image / ImageBatch / pipe / F)
+
+The same machinery with torch-flavoured spelling (fkl/highlevel.py,
+fkl/functional.py). Everything zero-copy; every pipeline lowers to ONE
+fused kernel through compose()'s JIT cache:
+
+```python
+t = fkl.Tensor(x)                      # torch cuda tensor / CAI obj / DeviceBuffer
+t = fkl.Tensor.empty((H, W, 3), "uint8")
+img = fkl.Image(x)                     # HWC, C in 1..4, planes == 1
+batch = fkl.ImageBatch([i0, i1, i2])   # or ONE (N, H, W[, C]) tensor
+                                       # (split into zero-copy plane views -> HF)
+out = (fkl.pipe(batch)
+       .crop(x, y, w, h)               # geometry FIRST (BVF into the read)
+       .resize((w2, h2))
+       .normalize(MEAN, STD)           # Cast('float32') if needed + Sub + Div
+       .to_planar("CHW")               # terminal: TensorSplit planar write
+       .run(out=None, stream=None))    # -> fkl.Tensor; .torch() = zero-copy view
+one = fkl.F.resize(img, (64, 64))      # eager one-op fused pipelines
+```
+
+Semantics to remember:
+- run() returns fkl.Tensor with the SEMANTIC shape ((C,H,W) / (N,C,H,W)
+  after to_planar); .torch()/.reshape() are metadata-only over the same
+  C-contiguous memory.
+- pipe methods append the SAME symbolic ops compose() takes (apply(op) for
+  anything else); types compile once, values ride in params[].
+- Geometry ops (crop/resize/border/warp) must precede compute ops — the
+  builder raises eagerly if you reorder.
+- OUT of scope: autograd, broadcasting, >4-channel images, multi-input
+  graphs. Input layout is 'HWC' only; 'CHW' is an output layout.
+
 ## Operation catalog
 
 Memory:    TensorRead(), TensorWrite(), TensorSplit() [packed->planar],
