@@ -34,6 +34,7 @@ disk cache in `~/.cache/fkl/` and start instantly.
 | `09_video_temporal_window.py` | CircularTensor: rolling N-frame window for temporal models, one fused update per frame |
 | `10_torch_realworld.py` | torch-specific recipe (needs torch+cuda installed) |
 | `11_yolo_inference.py` | **REAL end-to-end**: JPEG -> ONE fused GPU kernel (letterbox+normalize+CHW) -> YOLOv8n ONNX -> NMS -> boxes. Run `./fetch_yolo_assets.sh` first; needs `pip install numpy pillow onnxruntime` |
+| `12_torch_style_api.py` | PyTorch-style layer: `Image`/`ImageBatch` + `fkl.pipe(batch).resize().normalize().to_planar().run()` -> ONE fused kernel; eager `fkl.F.*` one-op calls |
 
 ## The one-page mental model
 
@@ -48,3 +49,6 @@ out  = pipe(x2)           # later calls: single ctypes call, ~70 us
   recompile.
 - Lists = Horizontal Fusion: `Crop([r1, r2, ...])` or `pipe([img1, img2])`.
 - `compose_divergent(plane_map, chain1, chain2)` = Divergent HF.
+- Torch-style spelling of the same thing:
+  `fkl.pipe(batch).resize((w, h)).normalize(m, s).to_planar("CHW").run()`
+  -> still ONE fused kernel (see `12_torch_style_api.py`).

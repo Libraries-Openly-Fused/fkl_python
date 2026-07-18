@@ -56,6 +56,49 @@ out = pipe(x, stream=torch.cuda.current_stream())   # zero-copy, async
 
 No torch? Use the built-in dependency-free `DeviceBuffer` (CUDA driver via ctypes).
 
+## PyTorch-style API: Tensor / Image / pipe
+
+A torch-flavoured layer over the same machinery — for users who think in
+tensors and image batches rather than op chains. Everything is zero-copy and
+every pipeline still lowers to **one** fused kernel:
+
+```python
+import torch, fkl
+
+frames = torch.randint(0, 256, (8, 720, 1280, 3),           # NHWC uint8
+                       device="cuda", dtype=torch.uint8)
+batch = fkl.ImageBatch(frames)          # zero-copy per-plane views
+                                        # (or a list of same-size images)
+
+out = (fkl.pipe(batch)
+       .resize((224, 224))              # BVF: fused into the read
+       .normalize(MEAN, STD)            # Cast+Sub+Div, in registers
+       .to_planar("CHW")                # planar NCHW write
+       .run())                          # ONE kernel for all 8 images
+
+net(out.torch())                        # zero-copy (8, 3, 224, 224) cuda tensor
+```
+
+- `fkl.Tensor(obj)` wraps torch CUDA tensors, `__cuda_array_interface__`
+  objects (cupy/numba) and `DeviceBuffer` without copying; exposes
+  `.shape/.dtype/.device`, `__cuda_array_interface__`, DLPack and
+  `.torch()`. `fkl.Tensor.empty(shape, dtype)` allocates.
+- `fkl.Image` = HWC image semantics (`width/height/channels`, C 1..4);
+  `fkl.ImageBatch` = list of same-shape images OR one batched
+  `(N, H, W[, C])` tensor. Input layout is `'HWC'`; planar `'CHW'` is an
+  OUTPUT layout produced by `.to_planar()` (the existing split ops).
+- `fkl.pipe(x)` methods (`crop`, `resize`, `border`, `cvt_color`,
+  `normalize`, `mul/add/sub/div`, `cast`, `saturate_cast`, `apply(op)`,
+  `to_planar`) each append an existing symbolic op; `.run()` goes through
+  `compose()`'s JIT cache — same rules: types compile once, values travel
+  in `params[]`. Geometry ops come first (they fuse into the read).
+- One-op eager calls: `fkl.F.resize(img, (64, 64))`,
+  `fkl.F.cvt_color(img, "BGR2GRAY")`, ... (each a one-op fused pipeline).
+
+Out of scope by design (use torch itself): autograd, broadcasting,
+>4-channel images (FKL vector pixels are 1..4 channels), multi-input graphs
+(the ABI is single-input/single-output; batches are horizontal fusion).
+
 ## Setup
 
 ### Plug and play (wheel with vendored headers)
@@ -205,11 +248,12 @@ testing the package.
 
 ## Examples
 
-`examples/` — 8 runnable, dependency-free scripts (see `examples/README.md`):
-vertical fusion basics, single-kernel DNN preprocessing, multi-ROI batch
-(HF), multi-camera + Divergent HF, color pipelines, warping + border
-policies, torch/DLPack interop, and a fused-vs-unfused benchmark
-(~5x at 1080p for a 6-op chain).
+`examples/` — 12 runnable scripts, most dependency-free (see
+`examples/README.md`): vertical fusion basics, single-kernel DNN
+preprocessing, multi-ROI batch (HF), multi-camera + Divergent HF, color
+pipelines, warping + border policies, torch/DLPack interop, a
+fused-vs-unfused benchmark (~5x at 1080p for a 6-op chain), temporal video
+windows, YOLO end-to-end, and the torch-style `pipe()` API.
 
 ## Current scope / next steps
 
